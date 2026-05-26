@@ -1,0 +1,1005 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>UE5 Level Preview</title>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { width: 100%; height: 100%; overflow: hidden; font-family: 'Segoe UI', Consolas, monospace; background: #0a0a1a; color: #ccc; }
+
+#app { display: flex; width: 100%; height: 100%; }
+
+/* ---- Left Sidebar ---- */
+#sidebar {
+    width: 320px; min-width: 320px; height: 100%;
+    background: #1a1a2e; border-right: 1px solid #2a2a4a;
+    display: flex; flex-direction: column; overflow: hidden;
+    user-select: none;
+}
+#sidebar h2 {
+    padding: 12px 16px; font-size: 14px; font-weight: 600;
+    background: #16213e; color: #e0e0ff; border-bottom: 1px solid #2a2a4a;
+    letter-spacing: 0.5px; text-transform: uppercase;
+}
+#actor-list {
+    flex: 1; overflow-y: auto; overflow-x: hidden;
+    border-bottom: 1px solid #2a2a4a;
+}
+#actor-list::-webkit-scrollbar { width: 6px; }
+#actor-list::-webkit-scrollbar-track { background: #1a1a2e; }
+#actor-list::-webkit-scrollbar-thumb { background: #3a3a5a; border-radius: 3px; }
+
+.actor-item {
+    padding: 8px 16px; cursor: pointer; border-bottom: 1px solid #222244;
+    transition: background 0.15s;
+}
+.actor-item:hover { background: #22224a; }
+.actor-item.selected { background: #0f3460; }
+.actor-item .actor-name { font-size: 13px; color: #e0e0ff; font-weight: 500; }
+.actor-item .actor-mesh { font-size: 11px; color: #8888aa; margin-top: 2px; }
+
+/* ---- Transform Section ---- */
+.transform-section {
+    padding: 12px 16px; border-bottom: 1px solid #2a2a4a;
+}
+.transform-section h3 {
+    font-size: 12px; color: #8888cc; margin-bottom: 8px;
+    text-transform: uppercase; letter-spacing: 0.5px;
+}
+.transform-row {
+    display: flex; align-items: center; margin-bottom: 4px; gap: 6px;
+}
+.transform-row label {
+    width: 20px; font-size: 11px; color: #8888aa; text-align: right; flex-shrink: 0;
+}
+.transform-row input {
+    flex: 1; background: #16213e; border: 1px solid #2a2a4a; color: #ccc;
+    padding: 4px 6px; font-size: 12px; font-family: 'Consolas', monospace;
+    border-radius: 3px; width: 70px;
+}
+.transform-row input:focus { outline: none; border-color: #4a4a8a; background: #1a2a4e; }
+
+#focus-btn {
+    display: block; width: calc(100% - 32px); margin: 10px 16px;
+    padding: 8px; background: #0f3460; color: #e0e0ff; border: none;
+    border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.5px;
+    transition: background 0.2s;
+}
+#focus-btn:hover { background: #1a4a80; }
+#focus-btn:disabled { opacity: 0.4; cursor: default; }
+
+/* ---- Viewport ---- */
+#viewport {
+    flex: 1; position: relative; overflow: hidden;
+}
+#viewport canvas { display: block; }
+
+#info-overlay {
+    position: absolute; top: 10px; right: 10px;
+    background: rgba(22,33,62,0.85); padding: 10px 14px;
+    border-radius: 6px; font-size: 11px; color: #8888cc;
+    pointer-events: none; line-height: 1.6;
+}
+
+#loading-overlay {
+    position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(10,10,26,0.9); display: flex;
+    align-items: center; justify-content: center;
+    flex-direction: column; z-index: 100;
+}
+#loading-overlay.hidden { display: none; }
+#loading-overlay .spinner {
+    width: 40px; height: 40px; border: 3px solid #2a2a4a;
+    border-top-color: #4a6adf; border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+#loading-overlay p { margin-top: 16px; color: #8888cc; font-size: 13px; }
+
+/* No-selection message */
+#no-selection {
+    padding: 16px; color: #555; font-size: 12px; text-align: center;
+    font-style: italic;
+}
+</style>
+</head>
+<body>
+<div id="app">
+    <!-- Left Sidebar -->
+    <div id="sidebar">
+        <h2>Scene Hierarchy</h2>
+        <div id="actor-list"></div>
+
+        <div id="no-selection">Click an actor to inspect</div>
+
+        <div id="selected-transform" style="display:none;">
+            <div class="transform-section">
+                <h3>Location</h3>
+                <div class="transform-row">
+                    <label>X</label><input type="number" step="1" id="loc-x">
+                    <label>Y</label><input type="number" step="1" id="loc-y">
+                    <label>Z</label><input type="number" step="1" id="loc-z">
+                </div>
+            </div>
+            <div class="transform-section">
+                <h3>Rotation</h3>
+                <div class="transform-row">
+                    <label>P</label><input type="number" step="1" id="rot-p">
+                    <label>Y</label><input type="number" step="1" id="rot-y">
+                    <label>R</label><input type="number" step="1" id="rot-r">
+                </div>
+            </div>
+            <div class="transform-section">
+                <h3>Scale</h3>
+                <div class="transform-row">
+                    <label>X</label><input type="number" step="0.1" id="scl-x">
+                    <label>Y</label><input type="number" step="0.1" id="scl-y">
+                    <label>Z</label><input type="number" step="0.1" id="scl-z">
+                </div>
+            </div>
+            <button id="focus-btn" disabled>Focus</button>
+        </div>
+
+        <div class="transform-section">
+            <h3>Camera</h3>
+            <div class="transform-row">
+                <label>X</label><input type="number" step="1" id="cam-x">
+                <label>Y</label><input type="number" step="1" id="cam-y">
+                <label>Z</label><input type="number" step="1" id="cam-z">
+            </div>
+            <div class="transform-row">
+                <label>P</label><input type="number" step="1" id="cam-p">
+                <label>Y</label><input type="number" step="1" id="cam-ya">
+                <label>R</label><input type="number" step="1" id="cam-r">
+            </div>
+        </div>
+    </div>
+
+    <!-- 3D Viewport -->
+    <div id="viewport">
+        <div id="loading-overlay">
+            <div class="spinner"></div>
+            <p id="loading-text">Loading scene…</p>
+        </div>
+        <div id="info-overlay">
+            <div>Click viewport to enable controls</div>
+            <div>WASD: Move | Q/E: Down/Up</div>
+            <div>Right-click drag: Look | Scroll: Speed</div>
+            <div>Shift: Fast | ESC: Release cursor</div>
+        </div>
+    </div>
+</div>
+
+<!-- Three.js from CDN -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+
+<script>
+// ===========================================================================
+// Globals
+// ===========================================================================
+let scene, camera, renderer;
+let sceneData = null;
+let actorObjects = {};      // actorName → THREE.Group
+let actorDataMap = {};       // actorName → actor data from API
+let selectedActor = null;
+let meshCache = {};          // meshName → Promise<THREE.BufferGeometry>
+let textureCache = {};       // texName → Promise<THREE.Texture>
+
+// Camera controls state
+let yaw = 0, pitch = 0;     // camera Euler angles (radians)
+let moveSpeed = 100;         // UE units/sec (cm)
+let keys = {};
+let pointerLocked = false;
+let isDraggingRight = false;
+let isPanning = false;
+let lastMouseX = 0, lastMouseY = 0;
+
+// Camera transform input editing
+let camInputFocused = false;
+
+// ===========================================================================
+// Coordinate conversion: UE → Three.js
+// ===========================================================================
+// UE: left-handed, Z-up, X-forward, Y-right
+// Three.js: right-handed, Y-up, Z-forward (looking down -Z)
+// Conversion matrix:
+//   three_x =  ue_x
+//   three_y =  ue_z
+//   three_z = -ue_y
+
+function ueToThreePos(ueLoc) {
+    return new THREE.Vector3(ueLoc.x, ueLoc.z, -ueLoc.y);
+}
+
+function threeToUEPos(threePos) {
+    return { x: threePos.x, y: -threePos.z, z: threePos.y };
+}
+
+function ueToThreeMatrix(loc, rot, scale) {
+    // Build UE transform matrix (4x4)
+    const pRad = rot.pitch * Math.PI / 180;
+    const yRad = rot.yaw   * Math.PI / 180;
+    const rRad = rot.roll  * Math.PI / 180;
+
+    const cp = Math.cos(pRad), sp = Math.sin(pRad);
+    const cy = Math.cos(yRad), sy = Math.sin(yRad);
+    const cr = Math.cos(rRad), sr = Math.sin(rRad);
+
+    // UE rotation: R = Rz(yaw) * Ry(pitch) * Rx(roll)
+    // Column-major for Three.js Matrix4.set():
+    //   set( m00, m01, m02, m03,  m10, m11, m12, m13,  m20, m21, m22, m23,  m30, m31, m32, m33 )
+    // But THREE.Matrix4.set() takes ROW-MAJOR arguments, stored column-major internally.
+
+    // Rotation matrix in UE space (row-major):
+    // [ cy*cp,  cy*sp*sr - sy*cr,  cy*sp*cr + sy*sr ]
+    // [ sy*cp,  sy*sp*sr + cy*cr,  sy*sp*cr - cy*sr ]
+    // [ -sp,    cp*sr,             cp*cr             ]
+
+    // Build as 4x4 in UE space (row-major for set())
+    const m = new THREE.Matrix4();
+    m.set(
+        cy*cp * scale.x,  (cy*sp*sr - sy*cr) * scale.y,  (cy*sp*cr + sy*sr) * scale.z,  loc.x,
+        sy*cp * scale.x,  (sy*sp*sr + cy*cr) * scale.y,  (sy*sp*cr - cy*sr) * scale.z,  loc.y,
+        -sp    * scale.x,  (cp*sr)             * scale.y,  (cp*cr)             * scale.z,  loc.z,
+        0,                 0,                              0,                              1
+    );
+
+    // Coordinate conversion: conv * M
+    const conv = new THREE.Matrix4();
+    conv.set(
+        1,  0,  0, 0,
+        0,  0,  1, 0,
+        0, -1,  0, 0,
+        0,  0,  0, 1
+    );
+
+    const result = new THREE.Matrix4();
+    result.multiplyMatrices(conv, m);
+    return result;
+}
+
+// Decompose a Three.js object's world matrix back to UE coordinates
+function threeToUETransform(obj) {
+    const wm = obj.matrixWorld;
+    // Inverse coordinate conversion
+    const convInv = new THREE.Matrix4();
+    convInv.set(
+        1,  0,  0, 0,
+        0,  0, -1, 0,
+        0,  1,  0, 0,
+        0,  0,  0, 1
+    );
+
+    const ueMat = new THREE.Matrix4();
+    ueMat.multiplyMatrices(convInv, wm);
+
+    // Extract translation
+    const loc = new THREE.Vector3();
+    loc.setFromMatrixPosition(ueMat);
+
+    // Extract scale
+    const scl = new THREE.Vector3();
+    scl.setFromMatrixScale(ueMat);
+
+    // Extract rotation as UE FRotator
+    // Remove scale from the 3x3 part
+    const rotMat = new THREE.Matrix4();
+    rotMat.extractRotation(ueMat);
+    const te = rotMat.elements;
+    // Row-major interpretation of the rotation:
+    // R[0][0]=te[0], R[0][1]=te[4], R[0][2]=te[8]
+    // R[1][0]=te[1], R[1][1]=te[5], R[1][2]=te[9]
+    // R[2][0]=te[2], R[2][1]=te[6], R[2][2]=te[10]
+    const r00=te[0], r01=te[4], r02=te[8];
+    const r10=te[1], r11=te[5], r12=te[9];
+    const r20=te[2], r21=te[6], r22=te[10];
+
+    // UE FRotator from rotation matrix:
+    // pitch = asin(-R[2][0])  (but careful with gimbal lock)
+    // yaw   = atan2(R[1][0], R[0][0])
+    // roll  = atan2(R[2][1], R[2][2])
+    let pitchDeg, yawDeg, rollDeg;
+    const spVal = -r20;
+    if (Math.abs(spVal) < 0.99999) {
+        pitchDeg = Math.asin(spVal) * 180 / Math.PI;
+        yawDeg = Math.atan2(r10, r00) * 180 / Math.PI;
+        rollDeg = Math.atan2(r21, r22) * 180 / Math.PI;
+    } else {
+        pitchDeg = spVal > 0 ? 90 : -90;
+        yawDeg = Math.atan2(-r01, r11) * 180 / Math.PI;
+        rollDeg = 0;
+    }
+
+    return {
+        location: { x: loc.x, y: loc.y, z: loc.z },
+        rotation: { pitch: pitchDeg, yaw: yawDeg, roll: rollDeg },
+        scale: { x: scl.x, y: scl.y, z: scl.z }
+    };
+}
+
+// ===========================================================================
+// OBJ Parser
+// ===========================================================================
+function parseOBJ(text) {
+    const positions = [];
+    const normals = [];
+    const uvs = [];
+    const faces = [];  // each face: [{v, vt, vn}, ...]
+
+    const lines = text.split('\n');
+    for (const line of lines) {
+        const parts = line.trim().split(/\s+/);
+        if (parts.length === 0) continue;
+        const cmd = parts[0];
+
+        if (cmd === 'v' && parts.length >= 4) {
+            positions.push(parseFloat(parts[1]), parseFloat(parts[2]), parseFloat(parts[3]));
+        } else if (cmd === 'vn' && parts.length >= 4) {
+            normals.push(parseFloat(parts[1]), parseFloat(parts[2]), parseFloat(parts[3]));
+        } else if (cmd === 'vt' && parts.length >= 3) {
+            uvs.push(parseFloat(parts[1]), parseFloat(parts[2]));
+        } else if (cmd === 'f') {
+            const face = [];
+            for (let i = 1; i < parts.length; i++) {
+                const indices = parts[i].split('/');
+                const v  = parseInt(indices[0]) - 1;
+                const vt = indices.length > 1 && indices[1] !== '' ? parseInt(indices[1]) - 1 : -1;
+                const vn = indices.length > 2 && indices[2] !== '' ? parseInt(indices[2]) - 1 : -1;
+                face.push({ v, vt, vn });
+            }
+            // Triangulate (fan triangulation for convex polygons)
+            for (let i = 1; i < face.length - 1; i++) {
+                faces.push([face[0], face[i], face[i + 1]]);
+            }
+        }
+    }
+
+    const hasNormals = normals.length > 0 && faces[0] && faces[0][0].vn >= 0;
+    const hasUVs = uvs.length > 0 && faces[0] && faces[0][0].vt >= 0;
+
+    // Build indexed or non-indexed BufferGeometry
+    // For simplicity, build non-indexed with all attributes
+    const vertCount = faces.length * 3;
+    const posArr = new Float32Array(vertCount * 3);
+    const normArr = hasNormals ? new Float32Array(vertCount * 3) : null;
+    const uvArr = hasUVs ? new Float32Array(vertCount * 2) : null;
+
+    let vi = 0;
+    for (const tri of faces) {
+        for (let c = 0; c < 3; c++) {
+            const idx = tri[c];
+            const pi = idx.v * 3;
+            posArr[vi * 3]     = positions[pi];
+            posArr[vi * 3 + 1] = positions[pi + 1];
+            posArr[vi * 3 + 2] = positions[pi + 2];
+
+            if (hasNormals && idx.vn >= 0) {
+                const ni = idx.vn * 3;
+                normArr[vi * 3]     = normals[ni];
+                normArr[vi * 3 + 1] = normals[ni + 1];
+                normArr[vi * 3 + 2] = normals[ni + 2];
+            }
+            if (hasUVs && idx.vt >= 0) {
+                const ui = idx.vt * 2;
+                uvArr[vi * 2]     = uvs[ui];
+                uvArr[vi * 2 + 1] = uvs[ui + 1];
+            }
+            vi++;
+        }
+    }
+
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
+    if (normArr) geom.setAttribute('normal', new THREE.BufferAttribute(normArr, 3));
+    else geom.computeVertexNormals();
+    if (uvArr) geom.setAttribute('uv', new THREE.BufferAttribute(uvArr, 2));
+
+    return geom;
+}
+
+// ===========================================================================
+// Asset loading
+// ===========================================================================
+function loadOBJ(meshName) {
+    if (meshCache[meshName]) return meshCache[meshName];
+
+    const p = fetch(`/Export/Meshes/${meshName}.obj`)
+        .then(r => {
+            if (!r.ok) throw new Error(`OBJ not found: ${meshName}`);
+            return r.text();
+        })
+        .then(text => {
+            const geom = parseOBJ(text);
+            geom.computeBoundingSphere();
+            geom.computeBoundingBox();
+            return geom;
+        })
+        .catch(err => {
+            console.warn('Failed to load OBJ:', meshName, err);
+            return null;
+        });
+
+    meshCache[meshName] = p;
+    return p;
+}
+
+function loadTexture(texName) {
+    if (textureCache[texName]) return textureCache[texName];
+
+    const p = new Promise((resolve) => {
+        const loader = new THREE.TextureLoader();
+        loader.load(
+            `/Export/Textures/${texName}.png`,
+            (tex) => {
+                tex.encoding = THREE.sRGBEncoding;
+                resolve(tex);
+            },
+            undefined,
+            () => {
+                console.warn('Failed to load texture:', texName);
+                resolve(null);
+            }
+        );
+    });
+
+    textureCache[texName] = p;
+    return p;
+}
+
+// ===========================================================================
+// Scene setup
+// ===========================================================================
+function initThree() {
+    const container = document.getElementById('viewport');
+    const w = container.clientWidth;
+    const h = container.clientHeight;
+
+    // Scene
+    scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x16213e);
+
+    // Camera
+    camera = new THREE.PerspectiveCamera(60, w / h, 1, 500000);
+    camera.position.set(0, 500, 0);
+
+    // Renderer
+    renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setSize(w, h);
+    renderer.setPixelRatio(window.devicePixelRatio);
+    renderer.outputEncoding = THREE.sRGBEncoding;
+    container.appendChild(renderer.domElement);
+
+    // Lights
+    const ambient = new THREE.AmbientLight(0x404040, 1.0);
+    scene.add(ambient);
+
+    const dirLight = new THREE.DirectionalLight(0xffffff, 1.0);
+    dirLight.position.set(1, 1, 1).normalize();
+    scene.add(dirLight);
+
+    // Grid
+    const grid = new THREE.GridHelper(10000, 100, 0x444466, 0x2a2a44);
+    scene.add(grid);
+
+    // Resize handler
+    window.addEventListener('resize', () => {
+        const w2 = container.clientWidth;
+        const h2 = container.clientHeight;
+        camera.aspect = w2 / h2;
+        camera.updateProjectionMatrix();
+        renderer.setSize(w2, h2);
+    });
+}
+
+// ===========================================================================
+// Build scene from API data
+// ===========================================================================
+async function buildScene() {
+    const loadingText = document.getElementById('loading-text');
+
+    // Fetch scene data
+    loadingText.textContent = 'Fetching scene data…';
+    const resp = await fetch('/api/scene');
+    if (!resp.ok) { loadingText.textContent = 'Failed to load scene data'; return; }
+    sceneData = await resp.json();
+
+    const actors = sceneData.actors;
+    loadingText.textContent = `Loading ${actors.length} actors…`;
+
+    // Populate actor list
+    populateActorList(actors);
+
+    // Group actors by mesh name for efficient loading
+    const meshNames = [...new Set(actors.map(a => a.mesh_name))];
+    let loaded = 0;
+
+    // Load all unique meshes first
+    for (const meshName of meshNames) {
+        loadingText.textContent = `Loading mesh (${++loaded}/${meshNames.length}): ${meshName}`;
+        await loadOBJ(meshName);
+    }
+
+    // Load textures
+    const texNames = [...new Set(actors.map(a => a.texture).filter(t => t))];
+    for (const texName of texNames) {
+        loadTexture(texName);  // fire and forget, will await when creating material
+    }
+
+    // Wait for all textures
+    await Promise.all(texNames.map(t => loadTexture(t)));
+
+    // Create objects for each actor
+    loadingText.textContent = 'Creating scene objects…';
+    let actorIdx = 0;
+
+    // Process in batches to avoid blocking
+    function processBatch() {
+        const batchSize = 50;
+        const end = Math.min(actorIdx + batchSize, actors.length);
+
+        for (; actorIdx < end; actorIdx++) {
+            const actor = actors[actorIdx];
+            createActorObject(actor);
+        }
+
+        if (actorIdx < actors.length) {
+            loadingText.textContent = `Creating objects (${actorIdx}/${actors.length})…`;
+            requestAnimationFrame(processBatch);
+        } else {
+            // Done
+            document.getElementById('loading-overlay').classList.add('hidden');
+
+            // Set initial camera from scene data
+            if (sceneData.camera.has_camera) {
+                setCameraFromUE(sceneData.camera.location, sceneData.camera.rotation);
+            } else {
+                // Try to find a reasonable default camera position
+                fitAllActorsInView();
+            }
+        }
+    }
+
+    if (actors.length > 0) {
+        requestAnimationFrame(processBatch);
+    } else {
+        document.getElementById('loading-overlay').classList.add('hidden');
+    }
+}
+
+function createActorObject(actor) {
+    const geomPromise = meshCache[actor.mesh_name];
+    if (!geomPromise) return;
+
+    // We need the geometry synchronously here — it should be loaded by now
+    // But since it's a promise, handle it
+    geomPromise.then(geom => {
+        if (!geom) return;
+
+        let material;
+        if (actor.texture) {
+            return loadTexture(actor.texture).then(tex => {
+                if (tex) {
+                    material = new THREE.MeshLambertMaterial({ map: tex, side: THREE.DoubleSide });
+                } else {
+                    material = new THREE.MeshLambertMaterial({ color: 0x888888, side: THREE.DoubleSide });
+                }
+                finalizeActor(actor, geom, material);
+            });
+        } else {
+            material = new THREE.MeshLambertMaterial({ color: 0x888888, side: THREE.DoubleSide });
+            finalizeActor(actor, geom, material);
+        }
+    });
+}
+
+function finalizeActor(actor, geom, material) {
+    const mesh = new THREE.Mesh(geom, material);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+
+    const group = new THREE.Group();
+    group.add(mesh);
+    group.name = actor.name;
+
+    // Apply UE transform
+    const mat4 = ueToThreeMatrix(actor.location, actor.rotation, actor.scale);
+    group.matrix.copy(mat4);
+    group.matrixAutoUpdate = false;
+    group.matrixWorldNeedsUpdate = true;
+
+    scene.add(group);
+    actorObjects[actor.name] = group;
+    actorDataMap[actor.name] = actor;
+}
+
+// ===========================================================================
+// Actor list UI
+// ===========================================================================
+function populateActorList(actors) {
+    const list = document.getElementById('actor-list');
+    list.innerHTML = '';
+
+    for (const actor of actors) {
+        const div = document.createElement('div');
+        div.className = 'actor-item';
+        div.dataset.name = actor.name;
+        div.innerHTML = `<div class="actor-name">${actor.name}</div>
+                         <div class="actor-mesh">${actor.mesh_name}${actor.texture ? ' 🎨' + actor.texture : ''}</div>`;
+        div.addEventListener('click', () => selectActor(actor.name));
+        list.appendChild(div);
+    }
+}
+
+function selectActor(name) {
+    // Deselect previous
+    if (selectedActor) {
+        const prev = actorObjects[selectedActor];
+        if (prev) {
+            prev.traverse(child => {
+                if (child.material && child.material.emissive) {
+                    child.material.emissive.setHex(0x000000);
+                }
+            });
+        }
+        const prevItem = document.querySelector(`.actor-item[data-name="${CSS.escape(selectedActor)}"]`);
+        if (prevItem) prevItem.classList.remove('selected');
+    }
+
+    selectedActor = name;
+
+    // Highlight new
+    const obj = actorObjects[name];
+    if (obj) {
+        obj.traverse(child => {
+            if (child.material && child.material.emissive) {
+                child.material.emissive.setHex(0x112244);
+            }
+        });
+    }
+
+    const item = document.querySelector(`.actor-item[data-name="${CSS.escape(name)}"]`);
+    if (item) {
+        item.classList.add('selected');
+        item.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+
+    // Show transform
+    document.getElementById('no-selection').style.display = 'none';
+    document.getElementById('selected-transform').style.display = 'block';
+    document.getElementById('focus-btn').disabled = false;
+
+    updateTransformInputs();
+}
+
+function updateTransformInputs() {
+    if (!selectedActor) return;
+    const actor = actorDataMap[selectedActor];
+    if (!actor) return;
+
+    document.getElementById('loc-x').value = actor.location.x.toFixed(1);
+    document.getElementById('loc-y').value = actor.location.y.toFixed(1);
+    document.getElementById('loc-z').value = actor.location.z.toFixed(1);
+    document.getElementById('rot-p').value = actor.rotation.pitch.toFixed(1);
+    document.getElementById('rot-y').value = actor.rotation.yaw.toFixed(1);
+    document.getElementById('rot-r').value = actor.rotation.roll.toFixed(1);
+    document.getElementById('scl-x').value = actor.scale.x.toFixed(2);
+    document.getElementById('scl-y').value = actor.scale.y.toFixed(2);
+    document.getElementById('scl-z').value = actor.scale.z.toFixed(2);
+}
+
+// ===========================================================================
+// Transform input handlers
+// ===========================================================================
+function onTransformInput() {
+    if (!selectedActor) return;
+    const actor = actorDataMap[selectedActor];
+    if (!actor) return;
+
+    // Read values from inputs
+    actor.location.x = parseFloat(document.getElementById('loc-x').value) || 0;
+    actor.location.y = parseFloat(document.getElementById('loc-y').value) || 0;
+    actor.location.z = parseFloat(document.getElementById('loc-z').value) || 0;
+    actor.rotation.pitch = parseFloat(document.getElementById('rot-p').value) || 0;
+    actor.rotation.yaw   = parseFloat(document.getElementById('rot-y').value) || 0;
+    actor.rotation.roll  = parseFloat(document.getElementById('rot-r').value) || 0;
+    actor.scale.x = parseFloat(document.getElementById('scl-x').value) || 1;
+    actor.scale.y = parseFloat(document.getElementById('scl-y').value) || 1;
+    actor.scale.z = parseFloat(document.getElementById('scl-z').value) || 1;
+
+    // Update Three.js object
+    const obj = actorObjects[selectedActor];
+    if (obj) {
+        const mat4 = ueToThreeMatrix(actor.location, actor.rotation, actor.scale);
+        obj.matrix.copy(mat4);
+        obj.matrixWorldNeedsUpdate = true;
+    }
+}
+
+// ===========================================================================
+// Camera controls
+// ===========================================================================
+function setCameraFromUE(loc, rot) {
+    // Build camera transform from UE coords
+    const mat4 = ueToThreeMatrix(loc, rot, {x:1, y:1, z:1});
+    const pos = new THREE.Vector3();
+    const quat = new THREE.Quaternion();
+    const scl = new THREE.Vector3();
+    mat4.decompose(pos, quat, scl);
+
+    camera.position.copy(pos);
+    camera.quaternion.copy(quat);
+
+    // Extract yaw/pitch for FPS controls
+    const euler = new THREE.Euler().setFromQuaternion(quat, 'YXZ');
+    yaw = euler.y;
+    pitch = euler.x;
+}
+
+function updateCameraFromYawPitch() {
+    const quat = new THREE.Quaternion();
+    const euler = new THREE.Euler(pitch, yaw, 0, 'YXZ');
+    quat.setFromEuler(euler);
+    camera.quaternion.copy(quat);
+}
+
+function updateCameraInputs() {
+    if (camInputFocused) return;
+
+    // Convert camera back to UE space
+    const ue = threeToUETransform(camera);
+
+    document.getElementById('cam-x').value = ue.location.x.toFixed(1);
+    document.getElementById('cam-y').value = ue.location.y.toFixed(1);
+    document.getElementById('cam-z').value = ue.location.z.toFixed(1);
+    document.getElementById('cam-p').value = ue.rotation.pitch.toFixed(1);
+    document.getElementById('cam-ya').value = ue.rotation.yaw.toFixed(1);
+    document.getElementById('cam-r').value = ue.rotation.roll.toFixed(1);
+}
+
+function onCameraInput() {
+    const loc = {
+        x: parseFloat(document.getElementById('cam-x').value) || 0,
+        y: parseFloat(document.getElementById('cam-y').value) || 0,
+        z: parseFloat(document.getElementById('cam-z').value) || 0,
+    };
+    const rot = {
+        pitch: parseFloat(document.getElementById('cam-p').value) || 0,
+        yaw:   parseFloat(document.getElementById('cam-ya').value) || 0,
+        roll:  parseFloat(document.getElementById('cam-r').value) || 0,
+    };
+    setCameraFromUE(loc, rot);
+}
+
+// ===========================================================================
+// Focus on selected actor
+// ===========================================================================
+function focusOnActor() {
+    if (!selectedActor) return;
+    const obj = actorObjects[selectedActor];
+    if (!obj) return;
+
+    // Compute bounding box
+    const box = new THREE.Box3();
+    obj.traverse(child => {
+        if (child.isMesh) {
+            child.geometry.computeBoundingBox();
+            const childBox = child.geometry.boundingBox.clone();
+            childBox.applyMatrix4(child.matrixWorld);
+            box.union(childBox);
+        }
+    });
+
+    if (box.isEmpty()) return;
+
+    const center = new THREE.Vector3();
+    box.getCenter(center);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    const maxDim = Math.max(size.x, size.y, size.z);
+    const distance = maxDim * 2.5;
+
+    // Position camera looking at center from current direction
+    const dir = new THREE.Vector3();
+    camera.getWorldDirection(dir);
+    const newPos = center.clone().sub(dir.multiplyScalar(distance));
+
+    camera.position.copy(newPos);
+    camera.lookAt(center);
+
+    // Update yaw/pitch from new orientation
+    const euler = new THREE.Euler().setFromQuaternion(camera.quaternion, 'YXZ');
+    yaw = euler.y;
+    pitch = euler.x;
+}
+
+function fitAllActorsInView() {
+    const box = new THREE.Box3();
+    for (const name in actorObjects) {
+        const obj = actorObjects[name];
+        obj.traverse(child => {
+            if (child.isMesh) {
+                child.geometry.computeBoundingBox();
+                const childBox = child.geometry.boundingBox.clone();
+                childBox.applyMatrix4(child.matrixWorld);
+                box.union(childBox);
+            }
+        });
+    }
+
+    if (box.isEmpty()) return;
+
+    const center = new THREE.Vector3();
+    box.getCenter(center);
+    const size = new THREE.Vector3();
+    box.getSize(size);
+    const maxDim = Math.max(size.x, size.y, size.z);
+    const distance = maxDim * 1.5;
+
+    camera.position.set(center.x + distance * 0.5, center.y + distance * 0.6, center.z + distance * 0.5);
+    camera.lookAt(center);
+
+    const euler = new THREE.Euler().setFromQuaternion(camera.quaternion, 'YXZ');
+    yaw = euler.y;
+    pitch = euler.x;
+}
+
+// ===========================================================================
+// Input event handlers
+// ===========================================================================
+function setupInputHandlers() {
+    const canvas = renderer.domElement;
+
+    // Pointer lock on click
+    canvas.addEventListener('click', () => {
+        if (!pointerLocked) {
+            canvas.requestPointerLock();
+        }
+    });
+
+    document.addEventListener('pointerlockchange', () => {
+        pointerLocked = document.pointerLockElement === canvas;
+        if (pointerLocked) {
+            document.getElementById('info-overlay').style.opacity = '0.3';
+        } else {
+            document.getElementById('info-overlay').style.opacity = '1';
+        }
+    });
+
+    // Mouse move (for camera rotation when pointer locked)
+    document.addEventListener('mousemove', (e) => {
+        if (pointerLocked) {
+            yaw   -= e.movementX * 0.003;
+            pitch -= e.movementY * 0.003;
+            pitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, pitch));
+            updateCameraFromYawPitch();
+        } else if (isDraggingRight) {
+            // Right-click drag for rotation without pointer lock
+            const dx = e.clientX - lastMouseX;
+            const dy = e.clientY - lastMouseY;
+            yaw   -= dx * 0.005;
+            pitch -= dy * 0.005;
+            pitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, pitch));
+            updateCameraFromYawPitch();
+            lastMouseX = e.clientX;
+            lastMouseY = e.clientY;
+        } else if (isPanning) {
+            // Middle mouse pan
+            const dx = e.clientX - lastMouseX;
+            const dy = e.clientY - lastMouseY;
+            const right = new THREE.Vector3();
+            const up = new THREE.Vector3();
+            right.setFromMatrixColumn(camera.matrixWorld, 0);
+            up.setFromMatrixColumn(camera.matrixWorld, 1);
+            camera.position.addScaledVector(right, -dx * moveSpeed * 0.02);
+            camera.position.addScaledVector(up, dy * moveSpeed * 0.02);
+            lastMouseX = e.clientX;
+            lastMouseY = e.clientY;
+        }
+    });
+
+    // Right-click drag for rotation
+    canvas.addEventListener('mousedown', (e) => {
+        if (e.button === 2) {  // right click
+            isDraggingRight = true;
+            lastMouseX = e.clientX;
+            lastMouseY = e.clientY;
+        } else if (e.button === 1) {  // middle click
+            isPanning = true;
+            lastMouseX = e.clientX;
+            lastMouseY = e.clientY;
+            e.preventDefault();
+        }
+    });
+
+    document.addEventListener('mouseup', (e) => {
+        if (e.button === 2) isDraggingRight = false;
+        if (e.button === 1) isPanning = false;
+    });
+
+    canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+    // Keyboard
+    document.addEventListener('keydown', (e) => {
+        keys[e.code] = true;
+        if (e.code === 'Escape' && pointerLocked) {
+            document.exitPointerLock();
+        }
+    });
+    document.addEventListener('keyup', (e) => {
+        keys[e.code] = false;
+    });
+
+    // Scroll wheel for speed
+    canvas.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        if (e.deltaY < 0) {
+            moveSpeed *= 1.2;
+        } else {
+            moveSpeed /= 1.2;
+        }
+        moveSpeed = Math.max(1, Math.min(100000, moveSpeed));
+    }, { passive: false });
+
+    // Transform inputs
+    ['loc-x','loc-y','loc-z','rot-p','rot-y','rot-r','scl-x','scl-y','scl-z'].forEach(id => {
+        document.getElementById(id).addEventListener('input', onTransformInput);
+    });
+
+    // Camera inputs
+    ['cam-x','cam-y','cam-z','cam-p','cam-ya','cam-r'].forEach(id => {
+        const el = document.getElementById(id);
+        el.addEventListener('focus', () => { camInputFocused = true; });
+        el.addEventListener('blur', () => { camInputFocused = false; });
+        el.addEventListener('input', onCameraInput);
+    });
+
+    // Focus button
+    document.getElementById('focus-btn').addEventListener('click', focusOnActor);
+}
+
+// ===========================================================================
+// Animation loop
+// ===========================================================================
+let lastTime = performance.now();
+
+function animate() {
+    requestAnimationFrame(animate);
+
+    const now = performance.now();
+    const dt = (now - lastTime) / 1000;
+    lastTime = now;
+
+    // Camera movement
+    if (pointerLocked || isDraggingRight) {
+        const speed = moveSpeed * dt * (keys['ShiftLeft'] || keys['ShiftRight'] ? 2 : 1);
+
+        const forward = new THREE.Vector3();
+        camera.getWorldDirection(forward);
+        const right = new THREE.Vector3();
+        right.crossVectors(forward, camera.up).normalize();
+
+        if (keys['KeyW']) camera.position.addScaledVector(forward, speed);
+        if (keys['KeyS']) camera.position.addScaledVector(forward, -speed);
+        if (keys['KeyA']) camera.position.addScaledVector(right, -speed);
+        if (keys['KeyD']) camera.position.addScaledVector(right, speed);
+        if (keys['KeyE']) camera.position.y += speed;
+        if (keys['KeyQ']) camera.position.y -= speed;
+    }
+
+    // Update camera inputs display
+    updateCameraInputs();
+
+    renderer.render(scene, camera);
+}
+
+// ===========================================================================
+// Init
+// ===========================================================================
+initThree();
+setupInputHandlers();
+buildScene();
+animate();
+</script>
+</body>
+</html>
