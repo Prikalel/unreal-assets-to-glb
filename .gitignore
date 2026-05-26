@@ -1,3 +1,4 @@
-UnreadlEngine*
+UnrealEngine-5.5.0-release/
 Input/
 Export/
+*.pyc
