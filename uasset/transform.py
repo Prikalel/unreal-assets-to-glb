@@ -43,9 +43,9 @@ def rotator_to_matrix(pitch: float, yaw: float, roll: float) -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 COORD_CONVERT = np.array([
-    [1,  0,  0, 0],
+    [0,  1,  0, 0],
     [0,  0,  1, 0],
-    [0, -1,  0, 0],
+    [-1, 0,  0, 0],
     [0,  0,  0, 1]
 ], dtype=float)
 

@@ -268,11 +268,11 @@ let camInputFocused = false;
 //   three_z = -ue_x
 
 function ueToThreePos(ueLoc) {
-    return new THREE.Vector3(-ueLoc.x, ueLoc.z, -ueLoc.y);
+    return new THREE.Vector3(ueLoc.y, ueLoc.z, -ueLoc.x);
 }
 
 function threeToUEPos(threePos) {
-    return { x: -threePos.x, y: -threePos.z, z: threePos.y };
+    return { x: -threePos.z, y: threePos.x, z: threePos.y };
 }
 
 function ueToThreeMatrix(loc, rot, scale) {
@@ -294,19 +294,32 @@ function ueToThreeMatrix(loc, rot, scale) {
         0,                 0,                              0,                              1
     );
 
-    // Coordinate conversion: conv * M
+    // Coordinate conversion: conv * M * convInv
     // Maps UE (X-fwd, Y-right, Z-up) → Three.js (X-right, Y-up, -Z-fwd)
-    // glTF = (-UE_X, UE_Z, -UE_Y)
+    // glTF = (UE_Y, UE_Z, -UE_X)
+    // The similarity transform is needed because GLB geometry is already
+    // in glTF space — we must convert the UE transform to glTF space.
     const conv = new THREE.Matrix4();
     conv.set(
-       -1,  0,  0, 0,
+        0,  1,  0, 0,
         0,  0,  1, 0,
-        0, -1,  0, 0,
+       -1,  0,  0, 0,
         0,  0,  0, 1
     );
 
+    const convInv = new THREE.Matrix4();
+    convInv.set(
+        0,  0, -1, 0,
+        1,  0,  0, 0,
+        0,  1,  0, 0,
+        0,  0,  0, 1
+    );
+
+    // result = conv * m * convInv
+    const temp = new THREE.Matrix4();
+    temp.multiplyMatrices(m, convInv);
     const result = new THREE.Matrix4();
-    result.multiplyMatrices(conv, m);
+    result.multiplyMatrices(conv, temp);
     return result;
 }
 
@@ -314,17 +327,28 @@ function ueToThreeMatrix(loc, rot, scale) {
 function threeToUETransform(obj) {
     const wm = obj.matrixWorld;
     // Inverse coordinate conversion: Three.js → UE
-    // Inverse of (-UE_X, UE_Z, -UE_Y) is (-glTF_X, -glTF_Z, glTF_Y)
+    // Inverse of (UE_Y, UE_Z, -UE_X) is (-glTF_Z, glTF_X, glTF_Y)
     const convInv = new THREE.Matrix4();
     convInv.set(
-       -1,  0,  0, 0,
         0,  0, -1, 0,
+        1,  0,  0, 0,
         0,  1,  0, 0,
         0,  0,  0, 1
     );
 
+    const conv = new THREE.Matrix4();
+    conv.set(
+        0,  1,  0, 0,
+        0,  0,  1, 0,
+       -1,  0,  0, 0,
+        0,  0,  0, 1
+    );
+
+    // ueMat = convInv * wm * conv  (inverse of the similarity transform)
+    const temp = new THREE.Matrix4();
+    temp.multiplyMatrices(wm, conv);
     const ueMat = new THREE.Matrix4();
-    ueMat.multiplyMatrices(convInv, wm);
+    ueMat.multiplyMatrices(convInv, temp);
 
     // Extract translation
     const loc = new THREE.Vector3();

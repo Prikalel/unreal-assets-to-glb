@@ -74,9 +74,13 @@ def _compute_rows_per_cut(size_y: int, num_cuts: int) -> int:
     return (size_y + num_cuts - 1) // num_cuts
 
 
-def _reverse_delta_tile(arr: np.ndarray, start_y: int, height: int,
-                        col_start: int, col_end: int) -> None:
-    """Reverse byte-level delta for one tile in-place."""
+def _reverse_delta_tile_u8(arr: np.ndarray, start_y: int, height: int,
+                           col_start: int, col_end: int) -> None:
+    """Reverse uint8 delta for one tile in-place.
+
+    Matches DeltaImage8 in ImageCoreDelta.cpp:
+      Reverse: Out[Y] = In[Y] + Out[Y-1]  (uint8 wrapping)
+    """
     for y in range(1, height):
         arr[start_y + y, col_start:col_end] = (
             arr[start_y + y, col_start:col_end].astype(np.int16)
@@ -87,17 +91,43 @@ def _reverse_delta_tile(arr: np.ndarray, start_y: int, height: int,
         arr[start_y + 1:start_y + height, col_start:col_end].astype(np.uint8)
 
 
-def undo_ue_delta(data: bytes, size_x: int, size_y: int, bpp: int) -> bytes:
+def _reverse_delta_tile_u16(arr: np.ndarray, start_y: int, height: int,
+                            col_start: int, col_end: int) -> None:
+    """Reverse uint16 delta for one tile in-place (with 0x8080 bias).
+
+    Matches DeltaImage16 in ImageCoreDelta.cpp with UEDELTA_DO_BIAS=1:
+      Reverse: Out[Y] = In[Y] + Out[Y-1] - 0x8080  (uint16 wrapping)
+    """
+    for y in range(1, height):
+        row = arr[start_y + y, col_start:col_end].astype(np.int32)
+        prev = arr[start_y + y - 1, col_start:col_end].astype(np.int32)
+        arr[start_y + y, col_start:col_end] = \
+            ((row + prev - 0x8080) & 0xFFFF).astype(np.uint16)
+
+
+def undo_ue_delta(data: bytes, size_x: int, size_y: int, bpp: int,
+                  element_size: int = 1) -> bytes:
     """Reverse the UEDELTA transform on texture source data.
 
     The image is split into tiles matching AddSplitStridedViewsForDelta,
-    then each tile has row 0 stored as-is and subsequent rows as byte deltas.
-    Reverse: Out[Y] = In[Y] + Out[Y-1] (byte addition, wrapping at 256).
-    """
-    stride = size_x * bpp
-    arr = np.frombuffer(data, dtype=np.uint8).copy().reshape(size_y, stride)
+    then each tile has row 0 stored as-is and subsequent rows as deltas.
 
-    if stride <= _CUT_STRIDE_BYTES:
+    element_size=1 → uint8 delta (no bias), for G8, BGRA8
+    element_size=2 → uint16 delta (0x8080 bias), for RGBA16, RGBA16F, G16
+    """
+    stride_bytes = size_x * bpp
+
+    if element_size == 2:
+        # Work with uint16 elements; cut calculations stay byte-based
+        arr = np.frombuffer(data, dtype=np.uint16).copy().reshape(
+            size_y, stride_bytes // 2)
+        stride = stride_bytes // 2  # stride in uint16 elements
+    else:
+        arr = np.frombuffer(data, dtype=np.uint8).copy().reshape(
+            size_y, stride_bytes)
+        stride = stride_bytes
+
+    if stride_bytes <= _CUT_STRIDE_BYTES:
         # No horizontal cuts, just vertical
         num_pixels = size_x * size_y
         num_cuts = _compute_num_cuts(num_pixels)
@@ -107,11 +137,14 @@ def undo_ue_delta(data: bytes, size_x: int, size_y: int, bpp: int) -> bytes:
         for cut in range(num_cuts):
             start_y = cut * rows_per_cut
             height = min(rows_per_cut, size_y - start_y)
-            _reverse_delta_tile(arr, start_y, height, 0, stride)
+            if element_size == 2:
+                _reverse_delta_tile_u16(arr, start_y, height, 0, stride)
+            else:
+                _reverse_delta_tile_u8(arr, start_y, height, 0, stride)
     else:
         # Horizontal cuts (stride > 4096)
-        num_h_parts = (stride + _CUT_STRIDE_BYTES - 1) // _CUT_STRIDE_BYTES
-        h_part_bytes = (stride + (num_h_parts // 2)) // num_h_parts
+        num_h_parts = (stride_bytes + _CUT_STRIDE_BYTES - 1) // _CUT_STRIDE_BYTES
+        h_part_bytes = (stride_bytes + (num_h_parts // 2)) // num_h_parts
         h_part_bytes = (h_part_bytes + 63) & ~63  # align to 64
         h_part_pixels = h_part_bytes // bpp
         num_h_parts = (size_x + h_part_pixels - 1) // h_part_pixels
@@ -129,9 +162,16 @@ def undo_ue_delta(data: bytes, size_x: int, size_y: int, bpp: int) -> bytes:
             for cut in range(num_cuts):
                 start_y = cut * rows_per_cut
                 height = min(rows_per_cut, size_y - start_y)
-                col_start = start_x * bpp
-                _reverse_delta_tile(arr, start_y, height, col_start,
-                                    col_start + strip_bytes)
+                col_start_bytes = start_x * bpp
+                if element_size == 2:
+                    _reverse_delta_tile_u16(
+                        arr, start_y, height,
+                        col_start_bytes // 2,
+                        (col_start_bytes + strip_bytes) // 2)
+                else:
+                    _reverse_delta_tile_u8(
+                        arr, start_y, height,
+                        col_start_bytes, col_start_bytes + strip_bytes)
 
     return arr.tobytes()
 
@@ -324,7 +364,10 @@ class Texture2D:
 
         # Apply UEDELTA reverse transform if needed
         if tex.compression_format == 4:  # TSCF_UEDELTA
-            raw_data = undo_ue_delta(raw_data, tex.width, tex.height, bpp)
+            # RGBA16, RGBA16F, G16 use uint16 delta with 0x8080 bias
+            elem_size = 2 if tex.format in (3, 4, 5) else 1
+            raw_data = undo_ue_delta(raw_data, tex.width, tex.height, bpp,
+                                     element_size=elem_size)
 
         # Decode pixel data based on format
         if tex.format == 1:  # TSF_BGRA8
@@ -332,6 +375,12 @@ class Texture2D:
             img = img_data.reshape(tex.height, tex.width, 4).copy()
             img[:, :, [0, 2]] = img[:, :, [2, 0]]  # BGRA -> RGBA
             tex.pixels = img
+
+        elif tex.format == 3:  # TSF_RGBA16
+            img_data = np.frombuffer(raw_data[:needed], dtype=np.uint16)
+            img = img_data.reshape(tex.height, tex.width, 4).copy()
+            # Convert 16-bit RGBA to 8-bit RGBA
+            tex.pixels = (img >> 8).astype(np.uint8)
 
         elif tex.format == 0:  # TSF_G8
             img_data = np.frombuffer(raw_data[:needed], dtype=np.uint8)

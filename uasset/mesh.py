@@ -516,13 +516,24 @@ def extract_mesh_data(elements: dict) -> Optional[dict]:
             # Channel 1 is lightmap UV and is skipped.
             if attr['channels']:
                 channel = attr['channels'][0]
+                dense_uvs = []
                 if isinstance(channel.get('data'), bytes):
+                    # Bounded attribute — direct data array
                     ch_raw = channel['data']
                     ch_count = channel['count']
-                    dense_uvs = []
                     for i in range(ch_count):
                         u, v = struct.unpack_from('<ff', ch_raw, i * 8)
                         dense_uvs.append((u, v))
+                elif 'chunks' in channel:
+                    # Unbounded attribute — collect data from chunks
+                    for chunk in channel.get('chunks', []):
+                        chunk_data = chunk.get('data')
+                        if isinstance(chunk_data, bytes):
+                            num_uvs = len(chunk_data) // 8
+                            for i in range(num_uvs):
+                                u, v = struct.unpack_from('<ff', chunk_data, i * 8)
+                                dense_uvs.append((u, v))
+                if dense_uvs:
                     uv_channels.append(_maybe_expand_sparse(dense_uvs, vi_ch, default=(0.0, 0.0)))
             break
     result['uvs'] = uv_channels
@@ -1065,7 +1076,7 @@ def export_glb(mesh: StaticMesh, filepath: str,
     # Geometry — one primitive per material group
     # ------------------------------------------------------------------
     # UE left-handed (X fwd, Y right, Z up) → glTF right-handed
-    # (X right, Y up, -Z fwd).  The mapping  glTF = (-UE_X, UE_Z, -UE_Y)
+    # (X right, Y up, -Z fwd).  The mapping  glTF = (UE_Y, UE_Z, -UE_X)
     # has determinant -1 so it flips handedness (and therefore face
     # winding CW→CCW) without needing a negative node scale.
     # ------------------------------------------------------------------
@@ -1083,13 +1094,13 @@ def export_glb(mesh: StaticMesh, filepath: str,
                     # Position — resolve through vi_to_vertex
                     v_idx = mesh.vi_to_vertex[vi] if vi < len(mesh.vi_to_vertex) else vi
                     pos = mesh.vertices[v_idx] if v_idx < len(mesh.vertices) else (0.0, 0.0, 0.0)
-                    # UE → glTF:  x=-ue_x, y=ue_z, z=-ue_y
-                    px, py, pz = -pos[0], pos[2], -pos[1]
+                    # UE → glTF:  x=ue_y, y=ue_z, z=-ue_x
+                    px, py, pz = pos[1], pos[2], -pos[0]
 
                     # Normal — same coordinate conversion
                     if has_normals and vi < len(mesh.normals):
                         n = mesh.normals[vi]
-                        nx, ny, nz = -n[0], n[2], -n[1]
+                        nx, ny, nz = n[1], n[2], -n[0]
                     else:
                         nx, ny, nz = 0.0, 1.0, 0.0
 
