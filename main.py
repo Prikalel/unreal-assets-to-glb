@@ -24,9 +24,14 @@ from tqdm import tqdm
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from uasset.package import Package
-from uasset.mesh import StaticMesh, export_obj
+from uasset.mesh import StaticMesh, export_glb
 from uasset.texture import Texture2D, export_png, is_base_color_texture
 from uasset.properties import read_properties
+from uasset.scene import (
+    _build_uasset_index,
+    _get_material_names_from_mesh,
+    _get_base_color_texture_from_material,
+)
 
 
 def find_uproject(input_dir):
@@ -88,7 +93,7 @@ def classify_uasset(filepath, input_dir):
 
 
 def process_assets(input_dir, export_dir):
-    """Find and export all meshes and base color textures."""
+    """Find and export all meshes as GLB and base color textures as PNG."""
     os.makedirs(os.path.join(export_dir, "Meshes"), exist_ok=True)
     os.makedirs(os.path.join(export_dir, "Textures"), exist_ok=True)
 
@@ -110,24 +115,17 @@ def process_assets(input_dir, export_dir):
 
     print(f"Classified: {len(meshes)} meshes, {len(textures)} textures, {len(others)} other")
 
-    # Export meshes
-    mesh_success = 0
-    for filepath, name in tqdm(sorted(meshes), desc="Exporting meshes", unit="mesh"):
-        try:
-            pkg = Package(filepath)
-            mesh = StaticMesh.from_package(pkg)
-            if mesh and mesh.vertices:
-                obj_path = os.path.join(export_dir, "Meshes", f"{name}.obj")
-                export_obj(mesh, obj_path)
-                mesh_success += 1
-        except Exception as e:
-            tqdm.write(f"  {name}: ERROR {e}")
+    # Build uasset index for texture resolution (mesh → material → texture chain)
+    uasset_index = _build_uasset_index(input_dir)
 
-    # Export base color textures only
+    # ------------------------------------------------------------------
+    # Export base color textures as PNG  (also cache pixel data for GLB)
+    # ------------------------------------------------------------------
     tex_success = 0
     base_color_textures = [(fp, n) for fp, n in textures if is_base_color_texture(n)]
     print(f"Base color textures: {len(base_color_textures)} out of {len(textures)}")
 
+    texture_cache = {}  # texture_name -> numpy RGBA pixels
     for filepath, name in tqdm(sorted(base_color_textures), desc="Exporting textures", unit="tex"):
         try:
             pkg = Package(filepath)
@@ -135,7 +133,36 @@ def process_assets(input_dir, export_dir):
             if texture and texture.pixels is not None:
                 png_path = os.path.join(export_dir, "Textures", f"{name}.png")
                 export_png(texture, png_path)
+                texture_cache[name] = texture.pixels
                 tex_success += 1
+        except Exception as e:
+            tqdm.write(f"  {name}: ERROR {e}")
+
+    # Identity map so _get_base_color_texture_from_material returns the texture name
+    tex_name_map = {name: name for name in texture_cache}
+
+    # ------------------------------------------------------------------
+    # Export meshes as GLB with embedded textures
+    # ------------------------------------------------------------------
+    mesh_success = 0
+    for filepath, name in tqdm(sorted(meshes), desc="Exporting meshes", unit="mesh"):
+        try:
+            pkg = Package(filepath)
+            mesh = StaticMesh.from_package(pkg)
+            if mesh and mesh.vertices:
+                # Resolve textures for each material slot via the import chain
+                mesh_textures = []
+                material_names = _get_material_names_from_mesh(name, uasset_index)
+                for mat_idx, mat_name in enumerate(material_names):
+                    tex_name = _get_base_color_texture_from_material(
+                        mat_name, uasset_index, tex_name_map)
+                    if tex_name and tex_name in texture_cache:
+                        mesh_textures.append((mat_idx, texture_cache[tex_name]))
+
+                glb_path = os.path.join(export_dir, "Meshes", f"{name}.glb")
+                export_glb(mesh, glb_path,
+                           textures=mesh_textures if mesh_textures else None)
+                mesh_success += 1
         except Exception as e:
             tqdm.write(f"  {name}: ERROR {e}")
 

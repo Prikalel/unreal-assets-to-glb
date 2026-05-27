@@ -12,6 +12,7 @@ import numpy as np
 
 from .package import Package
 from .properties import read_properties
+from .transform import rotator_to_matrix
 
 
 # ---------------------------------------------------------------------------
@@ -83,27 +84,9 @@ def resolve_import_path(pkg: Package, index: int) -> str:
 # UE transform math (pure UE space, no coordinate conversion)
 # ---------------------------------------------------------------------------
 
-def _rotator_to_matrix(pitch: float, yaw: float, roll: float) -> np.ndarray:
-    """Convert UE FRotator (degrees) to 3x3 rotation matrix."""
-    p = math.radians(pitch)
-    y = math.radians(yaw)
-    r = math.radians(roll)
-
-    cp, sp = math.cos(p), math.sin(p)
-    cy, sy = math.cos(y), math.sin(y)
-    cr, sr = math.cos(r), math.sin(r)
-
-    R = np.array([
-        [cy * cp,  cy * sp * sr - sy * cr,  cy * sp * cr + sy * sr],
-        [sy * cp,  sy * sp * sr + cy * cr,  sy * sp * cr - cy * sr],
-        [-sp,      cp * sr,                 cp * cr],
-    ])
-    return R
-
-
 def _make_ue_transform(location: tuple, rotation: tuple, scale: tuple) -> np.ndarray:
     """Build 4x4 transform matrix in UE space (no coordinate conversion)."""
-    R = _rotator_to_matrix(*rotation)
+    R = rotator_to_matrix(*rotation)
     s = np.array([scale[0], scale[1], scale[2]])
 
     T = np.eye(4, dtype=float)
@@ -228,10 +211,81 @@ def _read_export_properties(pkg: Package, export_index: int) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# LevelInstance helpers
+# ---------------------------------------------------------------------------
+
+def _extract_world_asset_path(world_asset_value, pkg: Package) -> str:
+    """Extract UE asset path from a WorldAsset property value.
+
+    Handles SoftObjectProperty (tuple), string, and ObjectProperty (int) values.
+    Returns the asset path like '/Game/Maps/Sublevels/L_SomeLevel' or "".
+    """
+    path = ""
+    if isinstance(world_asset_value, tuple):
+        # SoftObjectProperty: (path, subpath)
+        path = world_asset_value[0] if world_asset_value else ""
+    elif isinstance(world_asset_value, str):
+        path = world_asset_value
+    elif isinstance(world_asset_value, int) and world_asset_value != 0:
+        # ObjectProperty: FPackageIndex → resolve import path
+        path = resolve_import_path(pkg, world_asset_value)
+
+    if not path:
+        return ""
+
+    # Handle format like "World'/Game/Maps/Sublevels/L_SomeLevel.L_SomeLevel'"
+    if "'" in path:
+        start = path.index("'") + 1
+        end = path.rindex("'")
+        if start < end:
+            path = path[start:end]
+
+    # Remove trailing ".Name" duplicate (e.g., ".L_SomeLevel")
+    last_slash = path.rfind('/')
+    dot_pos = path.rfind('.')
+    if dot_pos > last_slash and dot_pos > 0:
+        path = path[:dot_pos]
+
+    return path
+
+
+def _resolve_umap_filesystem_path(asset_path: str, current_umap_path: str) -> str:
+    """Convert a UE asset path to a filesystem path.
+
+    Converts '/Game/Maps/Sublevels/L_SomeLevel' to
+    '<game_root>/Content/Maps/Sublevels/L_SomeLevel.umap'.
+    Returns "" if the path cannot be resolved.
+    """
+    if not asset_path.startswith('/Game/'):
+        return ""
+
+    # Find the game root by looking for 'Content' directory in current path
+    current_abs = os.path.normpath(os.path.abspath(current_umap_path))
+    parts = current_abs.replace('\\', '/').split('/')
+
+    content_idx = -1
+    for idx, part in enumerate(parts):
+        if part.lower() == 'content':
+            content_idx = idx
+            break
+
+    if content_idx < 0:
+        return ""
+
+    game_root = '/'.join(parts[:content_idx])
+    relative = asset_path[6:]  # Remove '/Game/'
+
+    fs_path = os.path.join(game_root, 'Content', relative + '.umap')
+    return os.path.normpath(fs_path)
+
+
+# ---------------------------------------------------------------------------
 # Level parser
 # ---------------------------------------------------------------------------
 
-def parse_level(filepath: str) -> LevelData:
+def parse_level(filepath: str, parent_transform: Optional[np.ndarray] = None,
+                 _visited: Optional[Set[str]] = None,
+                 _depth: int = 0) -> LevelData:
     """Parse a .umap file and extract actor placements with mesh references.
 
     Args:
@@ -243,6 +297,14 @@ def parse_level(filepath: str) -> LevelData:
     pkg = Package(filepath)
     map_name = os.path.splitext(os.path.basename(filepath))[0]
 
+    # Circular-reference guard and recursion depth limit
+    if _depth > 10:
+        return LevelData(map_name=map_name)
+    if _visited is None:
+        _visited = set()
+    current_abs = os.path.normpath(os.path.abspath(filepath))
+    _visited.add(current_abs)
+
     # Phase 1: Read properties for ALL exports
     export_props: Dict[int, dict] = {}
     for i in range(pkg.export_count):
@@ -250,7 +312,8 @@ def parse_level(filepath: str) -> LevelData:
         if class_name in ("StaticMeshActor", "StaticMeshComponent",
                           "SceneComponent", "ModelComponent", "Actor",
                           "PlayerStart", "CameraActor", "PlayerStartPIE",
-                          "SpringArmComponent", "CameraComponent"):
+                          "SpringArmComponent", "CameraComponent",
+                          "LevelInstance"):
             try:
                 props = _read_export_properties(pkg, i)
                 if props:
@@ -511,6 +574,84 @@ def parse_level(filepath: str) -> LevelData:
                     _walk_composed_tree(child_idx, parent_name, depth + 1)
 
         _walk_composed_tree(root_comp_export_idx, actor_label)
+
+    # Phase 5: Process LevelInstance actors (recursive sub-levels).
+    # Record how many actors came from this level before recursing.
+    local_actor_count = len(actors)
+
+    for i in range(pkg.export_count):
+        if export_classes.get(i) != "LevelInstance":
+            continue
+
+        li_props = export_props.get(i, {})
+        if not li_props:
+            continue
+
+        # Extract WorldAsset path
+        world_asset = li_props.get("WorldAsset")
+        if not world_asset:
+            continue
+
+        asset_path = _extract_world_asset_path(world_asset, pkg)
+        if not asset_path:
+            continue
+
+        # Resolve to filesystem path
+        sub_umap_path = _resolve_umap_filesystem_path(asset_path, filepath)
+        if not sub_umap_path:
+            continue
+
+        sub_abs = os.path.normpath(os.path.abspath(sub_umap_path))
+        if not os.path.isfile(sub_abs):
+            print(f"[umap] LevelInstance WorldAsset not found: {sub_umap_path}")
+            continue
+
+        if sub_abs in _visited:
+            print(f"[umap] LevelInstance circular reference skipped: {sub_umap_path}")
+            continue
+
+        # Get LevelInstance world transform from its RootComponent
+        root_comp_idx = li_props.get("RootComponent")
+        li_world = np.eye(4)
+        if isinstance(root_comp_idx, int) and root_comp_idx > 0:
+            comp_export_idx = root_comp_idx - 1
+            li_world = _get_world_transform(comp_export_idx)
+
+        # Compose: parent_transform @ li_world_transform
+        pt = parent_transform if parent_transform is not None else np.eye(4)
+        child_parent_transform = pt @ li_world
+
+        # Recursively parse sub-level
+        try:
+            sub_level = parse_level(sub_umap_path, child_parent_transform,
+                                    _visited, _depth + 1)
+        except Exception as exc:
+            print(f"[umap] Failed to parse sub-level {sub_umap_path}: {exc}")
+            continue
+
+        # Get LevelInstance actor name for parent reference
+        li_name = li_props.get("ActorLabel", pkg.exports[i].object_name)
+        if isinstance(li_name, bytes):
+            li_name = pkg.exports[i].object_name
+
+        # Set parent for sub-level actors that don't already have one
+        for actor in sub_level.actors:
+            if not actor.parent:
+                actor.parent = li_name
+
+        actors.extend(sub_level.actors)
+
+    # Apply parent_transform to actors parsed directly from this level
+    if parent_transform is not None and not np.allclose(parent_transform, np.eye(4)):
+        for actor in actors[:local_actor_count]:
+            local = _make_ue_transform(actor.world_location,
+                                       actor.world_rotation,
+                                       actor.world_scale)
+            world = parent_transform @ local
+            loc, rot, scl = _decompose_ue_transform(world)
+            actor.world_location = loc
+            actor.world_rotation = rot
+            actor.world_scale = scl
 
     return LevelData(
         map_name=map_name,

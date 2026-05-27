@@ -29,6 +29,27 @@ html, body { width: 100%; height: 100%; overflow: hidden; font-family: 'Segoe UI
 #actor-list::-webkit-scrollbar-track { background: #1a1a2e; }
 #actor-list::-webkit-scrollbar-thumb { background: #3a3a5a; border-radius: 3px; }
 
+/* Export button */
+#export-btn {
+    display: block;
+    width: calc(100% - 24px);
+    margin: 12px;
+    padding: 10px;
+    background: #e94560;
+    color: #fff;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 14px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    transition: background 0.2s;
+}
+#export-btn:hover { background: #ff6b81; }
+#export-btn:active { background: #c0392b; }
+#export-btn:disabled { opacity: 0.5; cursor: default; }
+
 /* Tree items */
 .tree-node { }
 .tree-header {
@@ -137,6 +158,7 @@ html, body { width: 100%; height: 100%; overflow: hidden; font-family: 'Segoe UI
     <!-- Left Sidebar -->
     <div id="sidebar">
         <h2>Scene Hierarchy</h2>
+        <button id="export-btn">⬇ EXPORT GLB</button>
         <div id="actor-list"></div>
 
         <div id="no-selection">Click an actor to inspect</div>
@@ -199,10 +221,19 @@ html, body { width: 100%; height: 100%; overflow: hidden; font-family: 'Segoe UI
     </div>
 </div>
 
-<!-- Three.js from CDN -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-
-<script>
+<!-- Three.js r160 — ES module imports via importmap -->
+<script type="importmap">
+{
+    "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+}
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 // ===========================================================================
 // Globals
 // ===========================================================================
@@ -212,8 +243,7 @@ let actorObjects = {};      // actorName → THREE.Group
 let actorDataMap = {};       // actorName → actor data from API
 let actorHeaders = {};       // actorName → tree header DOM element
 let selectedActor = null;
-let meshCache = {};          // meshName → Promise<THREE.BufferGeometry>
-let textureCache = {};       // texName → Promise<THREE.Texture>
+let glbCache = {};           // meshName → Promise<THREE.Group>
 
 // Camera controls state
 let yaw = 0, pitch = 0;     // camera Euler angles (radians)
@@ -329,130 +359,32 @@ function threeToUETransform(obj) {
 }
 
 // ===========================================================================
-// OBJ Parser
+// GLB Asset loading
 // ===========================================================================
-function parseOBJ(text) {
-    const positions = [];
-    const normals = [];
-    const uvs = [];
-    const faces = [];  // each face: [{v, vt, vn}, ...]
+function loadGLB(meshName) {
+    if (glbCache[meshName]) return glbCache[meshName];
 
-    const lines = text.split('\n');
-    for (const line of lines) {
-        const parts = line.trim().split(/\s+/);
-        if (parts.length === 0) continue;
-        const cmd = parts[0];
-
-        if (cmd === 'v' && parts.length >= 4) {
-            positions.push(parseFloat(parts[1]), parseFloat(parts[2]), parseFloat(parts[3]));
-        } else if (cmd === 'vn' && parts.length >= 4) {
-            normals.push(parseFloat(parts[1]), parseFloat(parts[2]), parseFloat(parts[3]));
-        } else if (cmd === 'vt' && parts.length >= 3) {
-            uvs.push(parseFloat(parts[1]), parseFloat(parts[2]));
-        } else if (cmd === 'f') {
-            const face = [];
-            for (let i = 1; i < parts.length; i++) {
-                const indices = parts[i].split('/');
-                const v  = parseInt(indices[0]) - 1;
-                const vt = indices.length > 1 && indices[1] !== '' ? parseInt(indices[1]) - 1 : -1;
-                const vn = indices.length > 2 && indices[2] !== '' ? parseInt(indices[2]) - 1 : -1;
-                face.push({ v, vt, vn });
-            }
-            // Triangulate (fan triangulation for convex polygons)
-            for (let i = 1; i < face.length - 1; i++) {
-                faces.push([face[0], face[i], face[i + 1]]);
-            }
-        }
-    }
-
-    const hasNormals = normals.length > 0 && faces[0] && faces[0][0].vn >= 0;
-    const hasUVs = uvs.length > 0 && faces[0] && faces[0][0].vt >= 0;
-
-    // Build non-indexed BufferGeometry
-    const vertCount = faces.length * 3;
-    const posArr = new Float32Array(vertCount * 3);
-    const normArr = hasNormals ? new Float32Array(vertCount * 3) : null;
-    const uvArr = hasUVs ? new Float32Array(vertCount * 2) : null;
-
-    let vi = 0;
-    for (const tri of faces) {
-        for (let c = 0; c < 3; c++) {
-            const idx = tri[c];
-            const pi = idx.v * 3;
-            posArr[vi * 3]     = positions[pi];
-            posArr[vi * 3 + 1] = positions[pi + 1];
-            posArr[vi * 3 + 2] = positions[pi + 2];
-
-            if (hasNormals && idx.vn >= 0) {
-                const ni = idx.vn * 3;
-                normArr[vi * 3]     = normals[ni];
-                normArr[vi * 3 + 1] = normals[ni + 1];
-                normArr[vi * 3 + 2] = normals[ni + 2];
-            }
-            if (hasUVs && idx.vt >= 0) {
-                const ui = idx.vt * 2;
-                uvArr[vi * 2]     = uvs[ui];
-                uvArr[vi * 2 + 1] = uvs[ui + 1];
-            }
-            vi++;
-        }
-    }
-
-    const geom = new THREE.BufferGeometry();
-    geom.setAttribute('position', new THREE.BufferAttribute(posArr, 3));
-    if (normArr) geom.setAttribute('normal', new THREE.BufferAttribute(normArr, 3));
-    else geom.computeVertexNormals();
-    if (uvArr) geom.setAttribute('uv', new THREE.BufferAttribute(uvArr, 2));
-
-    return geom;
-}
-
-// ===========================================================================
-// Asset loading
-// ===========================================================================
-function loadOBJ(meshName) {
-    if (meshCache[meshName]) return meshCache[meshName];
-
-    const p = fetch(`/Export/Meshes/${meshName}.obj`)
+    const p = fetch(`/Export/Meshes/${meshName}.glb`)
         .then(r => {
-            if (!r.ok) throw new Error(`OBJ not found: ${meshName}`);
-            return r.text();
+            if (!r.ok) throw new Error(`GLB not found: ${meshName}`);
+            return r.arrayBuffer();
         })
-        .then(text => {
-            const geom = parseOBJ(text);
-            geom.computeBoundingSphere();
-            geom.computeBoundingBox();
-            return geom;
+        .then(arrayBuffer => {
+            return new Promise((resolve, reject) => {
+                const loader = new GLTFLoader();
+                loader.parse(arrayBuffer, '', (gltf) => {
+                    resolve(gltf.scene);
+                }, (error) => {
+                    reject(error);
+                });
+            });
         })
         .catch(err => {
-            console.warn('Failed to load OBJ:', meshName, err);
+            console.warn('Failed to load GLB:', meshName, err);
             return null;
         });
 
-    meshCache[meshName] = p;
-    return p;
-}
-
-function loadTexture(texName) {
-    if (textureCache[texName]) return textureCache[texName];
-
-    const p = new Promise((resolve) => {
-        const loader = new THREE.TextureLoader();
-        loader.load(
-            `/Export/Textures/${texName}.png`,
-            (tex) => {
-                tex.encoding = THREE.sRGBEncoding;
-                resolve(tex);
-            },
-            undefined,
-            () => {
-                console.warn('Failed to load texture:', texName);
-                resolve(null);
-            }
-        );
-    });
-
-    textureCache[texName] = p;
+    glbCache[meshName] = p;
     return p;
 }
 
@@ -476,7 +408,7 @@ function initThree() {
     renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(w, h);
     renderer.setPixelRatio(window.devicePixelRatio);
-    renderer.outputEncoding = THREE.sRGBEncoding;
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
     container.appendChild(renderer.domElement);
 
     // Lights
@@ -519,24 +451,15 @@ async function buildScene() {
     // Populate actor tree
     populateActorTree(actors);
 
-    // Group actors by mesh name for efficient loading
-    const meshNames = [...new Set(actors.map(a => a.mesh_name))];
+    // Get unique mesh names that have GLB files
+    const meshNames = [...new Set(actors.filter(a => a.has_glb).map(a => a.mesh_name))];
     let loaded = 0;
 
-    // Load all unique meshes first
+    // Load all unique GLB files first
     for (const meshName of meshNames) {
         loadingText.textContent = `Loading mesh (${++loaded}/${meshNames.length}): ${meshName}`;
-        await loadOBJ(meshName);
+        await loadGLB(meshName);
     }
-
-    // Load textures
-    const texNames = [...new Set(actors.map(a => a.texture).filter(t => t))];
-    for (const texName of texNames) {
-        loadTexture(texName);  // fire and forget, will await when creating material
-    }
-
-    // Wait for all textures
-    await Promise.all(texNames.map(t => loadTexture(t)));
 
     // Create objects for each actor
     loadingText.textContent = 'Creating scene objects…';
@@ -549,7 +472,9 @@ async function buildScene() {
 
         for (; actorIdx < end; actorIdx++) {
             const actor = actors[actorIdx];
-            createActorObject(actor);
+            if (actor.has_glb) {
+                createActorObject(actor);
+            }
         }
 
         if (actorIdx < actors.length) {
@@ -577,49 +502,78 @@ async function buildScene() {
 }
 
 function createActorObject(actor) {
-    const geomPromise = meshCache[actor.mesh_name];
-    if (!geomPromise) return;
+    const glbPromise = glbCache[actor.mesh_name];
+    if (!glbPromise) return;
 
-    // We need the geometry synchronously here — it should be loaded by now
-    // But since it's a promise, handle it
-    geomPromise.then(geom => {
-        if (!geom) return;
+    glbPromise.then(glbScene => {
+        if (!glbScene) return;
 
-        let material;
-        if (actor.texture) {
-            return loadTexture(actor.texture).then(tex => {
-                if (tex) {
-                    material = new THREE.MeshLambertMaterial({ map: tex, side: THREE.DoubleSide });
-                } else {
-                    material = new THREE.MeshLambertMaterial({ color: 0x888888, side: THREE.DoubleSide });
-                }
-                finalizeActor(actor, geom, material);
-            });
-        } else {
-            material = new THREE.MeshLambertMaterial({ color: 0x888888, side: THREE.DoubleSide });
-            finalizeActor(actor, geom, material);
-        }
+        // Clone the loaded GLB scene for this actor instance
+        const clone = glbScene.clone(true);
+
+        const group = new THREE.Group();
+        group.add(clone);
+        group.name = actor.name;
+
+        // Apply UE world transform (already in world space from the server)
+        // Only the transform is converted; GLB geometry is already in glTF/Three.js space
+        const mat4 = ueToThreeMatrix(actor.location, actor.rotation, actor.scale);
+        group.matrix.copy(mat4);
+        group.matrixAutoUpdate = false;
+        group.matrixWorldNeedsUpdate = true;
+
+        scene.add(group);
+        actorObjects[actor.name] = group;
+        actorDataMap[actor.name] = actor;
     });
 }
 
-function finalizeActor(actor, geom, material) {
-    const mesh = new THREE.Mesh(geom, material);
-    mesh.castShadow = true;
-    mesh.receiveShadow = true;
+// ===========================================================================
+// Export scene as GLB
+// ===========================================================================
+function exportScene() {
+    const btn = document.getElementById('export-btn');
+    btn.disabled = true;
+    btn.textContent = '⏳ Exporting…';
 
-    const group = new THREE.Group();
-    group.add(mesh);
-    group.name = actor.name;
+    // Move actor objects into a temporary scene to exclude grid/lights
+    const tempScene = new THREE.Scene();
+    tempScene.name = 'ExportedScene';
+    for (const name in actorObjects) {
+        tempScene.attach(actorObjects[name]);
+    }
 
-    // Apply UE world transform (already in world space from the server)
-    const mat4 = ueToThreeMatrix(actor.location, actor.rotation, actor.scale);
-    group.matrix.copy(mat4);
-    group.matrixAutoUpdate = false;
-    group.matrixWorldNeedsUpdate = true;
+    const exporter = new GLTFExporter();
+    exporter.parse(tempScene, (result) => {
+        // Move objects back to the main scene
+        for (const name in actorObjects) {
+            scene.attach(actorObjects[name]);
+        }
 
-    scene.add(group);
-    actorObjects[actor.name] = group;
-    actorDataMap[actor.name] = actor;
+        // Download the GLB file
+        const blob = new Blob([result], { type: 'application/octet-stream' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'scene.glb';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+
+        btn.disabled = false;
+        btn.textContent = '⬇ EXPORT GLB';
+    }, (error) => {
+        console.error('Export failed:', error);
+
+        // Move objects back even on error
+        for (const name in actorObjects) {
+            scene.attach(actorObjects[name]);
+        }
+
+        btn.disabled = false;
+        btn.textContent = '⬇ EXPORT GLB';
+    }, { binary: true });
 }
 
 // ===========================================================================
@@ -1083,6 +1037,9 @@ function setupInputHandlers() {
 
     // Focus button
     document.getElementById('focus-btn').addEventListener('click', focusOnActor);
+
+    // Export button
+    document.getElementById('export-btn').addEventListener('click', exportScene);
 }
 
 // ===========================================================================

@@ -31,44 +31,23 @@ def build_scene_json(umap_path, export_dir, content_dir):
         dict with 'actors' and 'camera' keys.
     """
     from uasset.umap import parse_level
-    from uasset.scene import (
-        _build_uasset_index,
-        _get_material_names_from_mesh,
-        _get_base_color_texture_from_material,
-    )
 
     print(f"Parsing level: {umap_path}")
     level_data = parse_level(umap_path)
     print(f"Found {len(level_data.actors)} actors with mesh references")
 
-    # Build index of available exported textures
-    textures_dir = os.path.join(export_dir, "Textures")
-    exported_textures = set()
-    if os.path.isdir(textures_dir):
-        for f in os.listdir(textures_dir):
-            if f.lower().endswith('.png'):
-                exported_textures.add(os.path.splitext(f)[0])
-
-    # Build uasset index for material/texture resolution
-    uasset_index = _build_uasset_index(content_dir) if content_dir else {}
-
-    # Build tex_map: texture_name → exported_name (may differ in case)
-    tex_map = {name: name for name in exported_textures}
+    # Build index of available exported GLB meshes
+    meshes_dir = os.path.join(export_dir, "Meshes")
+    exported_glbs = set()
+    if os.path.isdir(meshes_dir):
+        for f in os.listdir(meshes_dir):
+            if f.lower().endswith('.glb'):
+                exported_glbs.add(os.path.splitext(f)[0])
 
     actors_json = []
     for actor in level_data.actors:
-        # Resolve texture
-        texture_name = None
-        if uasset_index:
-            materials = _get_material_names_from_mesh(actor.mesh_name, uasset_index)
-            for mat_name in materials:
-                tex = _get_base_color_texture_from_material(mat_name, uasset_index, tex_map)
-                if tex:
-                    # Check the PNG actually exists
-                    png_path = os.path.join(textures_dir, f"{tex}.png")
-                    if os.path.isfile(png_path):
-                        texture_name = tex
-                        break
+        # Check if a GLB file exists for this mesh (textures are embedded)
+        has_glb = actor.mesh_name in exported_glbs
 
         actors_json.append({
             "name": actor.name,
@@ -89,7 +68,7 @@ def build_scene_json(umap_path, export_dir, content_dir):
                 "z": actor.world_scale[2],
             },
             "parent": actor.parent,
-            "texture": texture_name or "",
+            "has_glb": has_glb,
         })
 
     camera_json = {
@@ -169,23 +148,30 @@ class PreviewHandler(http.server.BaseHTTPRequestHandler):
     def _serve_export_file(self, url_path, subdir):
         """Serve a file from Export/<subdir>/."""
         # Extract filename from URL
-        # /Export/Meshes/name.obj  ->  name.obj
-        # /meshes/name             ->  name.obj
+        # /Export/Meshes/name.glb  ->  name.glb
+        # /meshes/name             ->  name.glb
         parts = url_path.split('/')
         filename = parts[-1]
 
-        # /meshes/<name> without extension → default to .obj
+        # /meshes/<name> without extension → default to .glb
         if subdir == 'Meshes' and '.' not in filename:
-            filename += '.obj'
+            filename += '.glb'
 
         filepath = os.path.join(self.export_dir, subdir, filename)
         if not os.path.isfile(filepath):
             self.send_error(404, f'{filename} not found')
             return
 
-        mime, _ = mimetypes.guess_type(filename)
-        if mime is None:
-            mime = 'application/octet-stream'
+        # Explicit MIME types for glTF formats
+        ext = os.path.splitext(filename)[1].lower()
+        if ext == '.glb':
+            mime = 'model/gltf-binary'
+        elif ext == '.gltf':
+            mime = 'model/gltf+json'
+        else:
+            mime, _ = mimetypes.guess_type(filename)
+            if mime is None:
+                mime = 'application/octet-stream'
 
         try:
             with open(filepath, 'rb') as f:
@@ -217,9 +203,9 @@ def start_server(umap_path, export_dir, content_dir, port=3050):
 
     # Count unique meshes
     mesh_names = set(a['mesh_name'] for a in scene_data['actors'])
-    textured = sum(1 for a in scene_data['actors'] if a['texture'])
+    with_glb = sum(1 for a in scene_data['actors'] if a['texture'])
     print(f"Scene: {len(scene_data['actors'])} actors, "
-          f"{len(mesh_names)} unique meshes, {textured} textured")
+          f"{len(mesh_names)} unique meshes, {with_glb} with GLB")
 
     # Resolve path to preview.html (same directory as this script)
     script_dir = os.path.dirname(os.path.abspath(__file__))
