@@ -5,7 +5,7 @@ Pipeline: .uasset → Package → Trailer → FCompressedBuffer → Oodle decomp
 """
 import os
 import struct
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import ooz
@@ -601,6 +601,122 @@ def extract_mesh_data(elements: dict) -> Optional[dict]:
 
 
 # ---------------------------------------------------------------------------
+# StaticMaterials parser
+# ---------------------------------------------------------------------------
+
+def _parse_static_materials(pkg: Package) -> Optional[Dict[str, str]]:
+    """Parse the StaticMaterials property from the StaticMesh export data.
+
+    Reads the real material-slot-to-import mapping from the UStaticMesh
+    export's serialized ``StaticMaterials`` array.  Each ``FStaticMaterial``
+    element contains an ``ImportedMaterialSlotName`` and a
+    ``MaterialInterface`` (FPackageIndex pointing to a material import).
+
+    Returns:
+        Dict mapping ``ImportedMaterialSlotName`` → material import object
+        name, or ``None`` if parsing fails.
+    """
+    from .properties import read_properties
+
+    # Find the StaticMesh export
+    sm_export_idx = None
+    for i in range(pkg.export_count):
+        if pkg.get_export_class_name(i) == 'StaticMesh':
+            sm_export_idx = i
+            break
+    if sm_export_idx is None:
+        return None
+
+    reader = pkg.get_export_data(sm_export_idx)
+    if reader is None:
+        return None
+    data = reader.data
+
+    # Find the FName index for "StaticMaterials"
+    sm_name_idx = None
+    for ni, n in enumerate(pkg.name_map):
+        if n == 'StaticMaterials':
+            sm_name_idx = ni
+            break
+    if sm_name_idx is None:
+        return None
+
+    # Search for the FName (index + number=0) in the binary data
+    target = struct.pack('<ii', sm_name_idx, 0)
+    offset = 0
+    while offset < len(data) - len(target):
+        idx = data.find(target, offset)
+        if idx == -1:
+            return None
+        try:
+            result = _parse_static_materials_at(data, idx, pkg)
+            if result is not None:
+                return result
+        except Exception:
+            pass
+        offset = idx + 1
+    return None
+
+
+def _parse_static_materials_at(data: bytes, offset: int,
+                               pkg: Package) -> Optional[Dict[str, str]]:
+    """Try to parse the StaticMaterials array property at *offset*."""
+    from .properties import read_properties
+
+    r = BinaryReader(data)
+    r.seek(offset)
+
+    # Skip Name FName (8 bytes)
+    r.skip(8)
+
+    # Skip type tree (FPropertyTypeName)
+    total_nodes = 1
+    i = 0
+    while i < total_nodes:
+        r.skip(8)  # FName (idx + number)
+        inner_count = r.read_int32()
+        total_nodes += inner_count
+        i += 1
+
+    # Size
+    size = r.read_int32()
+    if size <= 0 or size > len(data):
+        return None
+
+    # Flags
+    flags = r.read_uint8()
+    if flags & 0x01:  # HasArrayIndex
+        r.skip(4)
+    if flags & 0x02:  # HasPropertyGuid
+        r.skip(16)
+    if flags & 0x04:  # HasPropertyExtensions
+        ext = r.read_uint8()
+        if ext & 0x01:
+            r.skip(1 + 4)
+
+    # Array element count
+    arr_count = r.read_int32()
+    if arr_count < 0 or arr_count > 256:
+        return None
+
+    # Parse each FStaticMaterial struct (properties until "None")
+    result: Dict[str, str] = {}
+    for _ in range(arr_count):
+        elem_props = read_properties(r, pkg.name_map, pkg.file_version_ue5)
+        imported_slot_name = elem_props.get('ImportedMaterialSlotName')
+        material_interface = elem_props.get('MaterialInterface')
+        if imported_slot_name is None or material_interface is None:
+            continue
+        # Resolve FPackageIndex to import name
+        if isinstance(material_interface, int) and material_interface < 0:
+            imp_idx = -material_interface - 1
+            if 0 <= imp_idx < len(pkg.imports):
+                result[imported_slot_name] = pkg.imports[imp_idx].object_name
+
+    return result if result else None
+
+
+# ---------------------------------------------------------------------------
 # StaticMesh class
 # ---------------------------------------------------------------------------
 
@@ -612,6 +728,9 @@ class StaticMesh:
         self.triangles: List[Tuple[int, int, int, int]] = []  # (vi0, vi1, vi2, material_index)
         self.vi_to_vertex: List[int] = []
         self.material_slot_names: Optional[List[Optional[str]]] = None
+        # Real mapping from ImportedMaterialSlotName → material import name,
+        # parsed from the StaticMaterials export property.
+        self.material_slots: Optional[Dict[str, str]] = None
 
     @classmethod
     def from_package(cls, pkg: Package) -> Optional['StaticMesh']:
@@ -649,6 +768,9 @@ class StaticMesh:
         mesh.uvs = mesh_data['uvs']
         mesh.triangles = mesh_data['triangles']
         mesh.material_slot_names = mesh_data.get('material_slot_names')
+
+        # Parse real material slot mapping from export data
+        mesh.material_slots = _parse_static_materials(pkg)
 
         return mesh
 

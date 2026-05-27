@@ -210,50 +210,38 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None)
             pkg = Package(filepath)
             mesh = StaticMesh.from_package(pkg)
             if mesh and mesh.vertices:
-                # Resolve textures for each material slot via the import chain.
-                # The key insight: polygon group N in the triangle data does NOT
-                # necessarily correspond to material import slot N.  The
-                # ImportedMaterialSlotName attribute maps each polygon group to a
-                # slot name, which must be matched against the ordered material
-                # import names to find the correct texture.
+                # Resolve textures for each polygon group via the real
+                # material-slot mapping parsed from the StaticMaterials
+                # export property.  Each polygon group has an
+                # ImportedMaterialSlotName which maps to a concrete material
+                # import name through the StaticMaterials array.
                 mesh_textures = []
-                material_names = _get_material_names_from_mesh(name, uasset_index)
 
-                if mesh.material_slot_names:
-                    # Multi-(or single-)material mesh with slot name info:
-                    # match each polygon group's slot name to a material import.
+                if mesh.material_slots and mesh.material_slot_names:
+                    # Real data path: StaticMaterials gives us the exact
+                    # ImportedMaterialSlotName → material-import-name mapping.
                     for pg_idx, slot_name in enumerate(mesh.material_slot_names):
                         if slot_name is None:
                             continue
-                        matched_mat_idx = None
-                        for mat_idx, mat_name in enumerate(material_names):
-                            # Strip common material-instance prefixes
-                            clean = mat_name
-                            for prefix in ('MI_', 'M_'):
-                                if clean.startswith(prefix):
-                                    clean = clean[len(prefix):]
-                                    break
-                            if (slot_name == clean
-                                    or slot_name in clean
-                                    or clean in slot_name):
-                                matched_mat_idx = mat_idx
-                                break
-                        if matched_mat_idx is None:
-                            matched_mat_idx = pg_idx  # fallback
-                        if matched_mat_idx < len(material_names):
-                            tex_name = _get_base_color_texture_from_material(
-                                material_names[matched_mat_idx],
-                                uasset_index, tex_name_map)
-                            if tex_name and tex_name in texture_cache:
-                                mesh_textures.append(
-                                    (pg_idx, texture_cache[tex_name]))
+                        mat_name = mesh.material_slots.get(slot_name)
+                        if mat_name is None:
+                            continue
+                        tex_name = _get_base_color_texture_from_material(
+                            mat_name, uasset_index, tex_name_map)
+                        if tex_name and tex_name in texture_cache:
+                            mesh_textures.append(
+                                (pg_idx, texture_cache[tex_name]))
                 else:
-                    # No slot name info — assume polygon group == material index
+                    # Fallback: no StaticMaterials data — assume polygon
+                    # group index == material import index.
+                    material_names = _get_material_names_from_mesh(
+                        name, uasset_index)
                     for mat_idx, mat_name in enumerate(material_names):
                         tex_name = _get_base_color_texture_from_material(
                             mat_name, uasset_index, tex_name_map)
                         if tex_name and tex_name in texture_cache:
-                            mesh_textures.append((mat_idx, texture_cache[tex_name]))
+                            mesh_textures.append(
+                                (mat_idx, texture_cache[tex_name]))
 
                 glb_path = os.path.join(export_dir, "Meshes", f"{name}.glb")
                 export_glb(mesh, glb_path,

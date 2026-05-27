@@ -77,12 +77,16 @@ def _get_material_names_from_mesh(mesh_name: str,
 
 def _get_base_color_texture_from_material(material_name: str,
                                           uasset_index: Dict[str, str],
-                                          tex_map: Dict[str, str]) -> Optional[str]:
+                                          tex_map: Dict[str, str],
+                                          _depth: int = 0) -> Optional[str]:
     """Resolve a base-colour texture name from a material's import chain.
 
     Opens the material's .uasset package, looks for ``Texture2D`` imports
     whose name ends with a base-colour suffix (``_BC``, ``_B``, ``_D``, …),
     and returns the mapped texture name from *tex_map*.
+
+    If no texture is found directly, follows the parent
+    ``MaterialInstanceConstant`` import chain recursively (up to 8 levels).
 
     Args:
         material_name:  Material asset name.
@@ -92,12 +96,15 @@ def _get_base_color_texture_from_material(material_name: str,
     Returns:
         The resolved texture name from *tex_map*, or ``None``.
     """
+    if _depth > 8:
+        return None
     from .package import Package
     filepath = uasset_index.get(material_name)
     if filepath is None:
         return None
     try:
         pkg = Package(filepath)
+        parent_name = None
         for imp in pkg.imports:
             if imp.class_name == 'Texture2D':
                 tex_name = imp.object_name
@@ -107,6 +114,15 @@ def _get_base_color_texture_from_material(material_name: str,
                     for en, ep in tex_map.items():
                         if en.lower() == tex_name.lower():
                             return ep
+            # Remember the first MaterialInstanceConstant parent
+            if (parent_name is None
+                    and imp.class_name in ('MaterialInstanceConstant', 'Material')
+                    and imp.object_name != material_name):
+                parent_name = imp.object_name
+        # No texture found directly — try the parent material
+        if parent_name is not None:
+            return _get_base_color_texture_from_material(
+                parent_name, uasset_index, tex_map, _depth + 1)
         return None
     except Exception as e:
         logger.debug(f"Failed to read material package for '{material_name}': {e}")
