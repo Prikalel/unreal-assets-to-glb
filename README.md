@@ -1,6 +1,6 @@
 # UE 5.5 UAsset Parser & Exporter
 
-Extracts static meshes (OBJ) and base color textures (PNG) from Unreal Engine 5.5 `.uasset` files. Supports browser-based level preview with `--preview`.
+Extracts static meshes (glb) and base color textures (PNG) from Unreal Engine 5.5 `.uasset` files. Supports browser-based level preview with `--preview`.
 
 ## Requirements
 
@@ -9,10 +9,7 @@ Extracts static meshes (OBJ) and base color textures (PNG) from Unreal Engine 5.
 - Pillow
 - ooz-python
 - tqdm
-
-```
-pip install numpy Pillow ooz-python tqdm
-```
+- TODO : add other requirements
 
 ## Usage
 
@@ -25,6 +22,22 @@ python main.py ./Input --preview L_Showcase.umap
 
 # Preview without re-exporting
 python main.py ./Input --skip-export --preview L_Showcase.umap
+
+# Export without textures
+python main.py ./Input --skip-textures
+
+# Export only meshes with certain filesname (all containing Pipe in name)
+python main.py ./Input --filter Pipe
 ```
 
 The input directory should contain a `.uproject` file and a `Content/` folder with `.uasset` / `.umap` files.
+
+The output is `./Export` folder created in current workspace.
+
+## Features
+
+- level parts (level isntansing) included in preview
+- material parent recursive search
+- slot indexes recognition
+- multiple UV channels
+- texture override in material instance

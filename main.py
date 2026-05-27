@@ -29,7 +29,7 @@ from uasset.package import Package
 from uasset.mesh import StaticMesh, export_glb
 import pickle
 import hashlib
-from uasset.texture import Texture2D, export_png, is_base_color_texture
+from uasset.texture import Texture2D, export_png
 from uasset.properties import read_properties
 from uasset.scene import (
     _build_uasset_index,
@@ -83,14 +83,6 @@ def classify_uasset(filepath, input_dir):
             elif class_name in ("Texture2D", "TextureCube", "VolumeTexture"):
                 name = os.path.splitext(os.path.basename(filepath))[0]
                 return 'texture', name
-        # Check by file location (Textures/ folder)
-        rel = os.path.relpath(filepath, input_dir).replace('\\', '/')
-        if '/Textures/' in rel or '/textures/' in rel:
-            name = os.path.splitext(os.path.basename(filepath))[0]
-            return 'texture', name
-        elif '/Meshes/' in rel or '/meshes/' in rel:
-            name = os.path.splitext(os.path.basename(filepath))[0]
-            return 'mesh', name
         return 'other', os.path.splitext(os.path.basename(filepath))[0]
     except Exception:
         return 'other', os.path.splitext(os.path.basename(filepath))[0]
@@ -137,18 +129,17 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None)
     def _input_fingerprint():
         h = hashlib.md5()
         for fp, n in sorted(textures):
-            if is_base_color_texture(n):
-                h.update(n.encode())
-                h.update(str(os.path.getmtime(fp)).encode())
-                h.update(str(os.path.getsize(fp)).encode())
+            h.update(n.encode())
+            h.update(str(os.path.getmtime(fp)).encode())
+            h.update(str(os.path.getsize(fp)).encode())
         return h.hexdigest()
 
     tex_success = 0
     texture_cache = {}  # texture_name -> numpy RGBA pixels
     tex_name_map = {}
 
-    base_color_textures = [(fp, n) for fp, n in textures if is_base_color_texture(n)]
-    print(f"Base color textures: {len(base_color_textures)} out of {len(textures)}")
+    base_color_textures = [(fp, n) for fp, n in textures]  # export ALL textures
+    print(f"Textures to export: {len(base_color_textures)}")
 
     # Try loading from pickle cache
     fp_hash = _input_fingerprint()
@@ -218,12 +209,22 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None)
                 mesh_textures = []
 
                 if mesh.material_slots and mesh.material_slot_names:
-                    # Real data path: StaticMaterials gives us the exact
-                    # ImportedMaterialSlotName → material-import-name mapping.
+                    # Real data path: material_slots is an ordered list of
+                    # (slot_name, material_name) indexed by StaticMaterials
+                    # slot index.  Use SectionInfoMap to map each polygon
+                    # group to the correct material slot index.
+                    section_map = getattr(mesh, 'section_info_map', None)
                     for pg_idx, slot_name in enumerate(mesh.material_slot_names):
                         if slot_name is None:
                             continue
-                        mat_name = mesh.material_slots.get(slot_name)
+                        # Resolve pg_idx → material slot index
+                        slot_idx = (section_map[pg_idx]
+                                    if section_map and pg_idx < len(section_map)
+                                    else pg_idx)
+                        if slot_idx < len(mesh.material_slots):
+                            mat_name = mesh.material_slots[slot_idx][1]
+                        else:
+                            mat_name = None
                         if mat_name is None:
                             continue
                         tex_name = _get_base_color_texture_from_material(
@@ -267,7 +268,7 @@ def find_umap_path(input_dir, umap_filename):
     return None
 
 
-def preview_level(input_dir, export_dir, umap_filename, use_gl=False):
+def preview_level(input_dir, export_dir, umap_filename):
     """Parse a .umap file and show a 3D preview in the browser."""
     from preview_server import start_server
 
@@ -313,10 +314,6 @@ def main():
         '--filter', metavar='SUBSTRING', dest='mesh_filter',
         help='Only export meshes whose name contains this substring (case-insensitive)'
     )
-    parser.add_argument(
-        '--gl', action='store_true',
-        help='Use pyglet/OpenGL renderer instead of matplotlib CPU renderer'
-    )
     args = parser.parse_args()
 
     input_dir = os.path.abspath(args.input_dir)
@@ -345,7 +342,7 @@ def main():
     # Preview if requested
     if args.preview:
         print(f"\n{'=' * 60}")
-        preview_level(input_dir, export_dir, args.preview, use_gl=args.gl)
+        preview_level(input_dir, export_dir, args.preview)
 
 
 if __name__ == "__main__":

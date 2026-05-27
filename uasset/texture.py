@@ -48,9 +48,6 @@ TSCF_MAP = {
     'TSCF_UEDELTA': 4,
 }
 
-# Suffixes for base color (diffuse) textures
-BASE_COLOR_SUFFIXES = ('_BC', '_B', '_D')
-
 
 # ---------------------------------------------------------------------------
 # UEDELTA reverse transform
@@ -418,8 +415,3 @@ def export_png(texture: Texture2D, filepath: str) -> None:
 
     pil_img.save(filepath)
 
-
-def is_base_color_texture(filename: str) -> bool:
-    """Check if a texture filename looks like a base color (diffuse) map."""
-    base = os.path.splitext(filename)[0]
-    return any(base.endswith(suf) for suf in BASE_COLOR_SUFFIXES)

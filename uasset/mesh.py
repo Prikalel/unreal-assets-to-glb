@@ -615,7 +615,7 @@ def extract_mesh_data(elements: dict) -> Optional[dict]:
 # StaticMaterials parser
 # ---------------------------------------------------------------------------
 
-def _parse_static_materials(pkg: Package) -> Optional[Dict[str, str]]:
+def _parse_static_materials(pkg: Package) -> Optional[List[Tuple[str, str]]]:
     """Parse the StaticMaterials property from the StaticMesh export data.
 
     Reads the real material-slot-to-import mapping from the UStaticMesh
@@ -624,8 +624,8 @@ def _parse_static_materials(pkg: Package) -> Optional[Dict[str, str]]:
     ``MaterialInterface`` (FPackageIndex pointing to a material import).
 
     Returns:
-        Dict mapping ``ImportedMaterialSlotName`` → material import object
-        name, or ``None`` if parsing fails.
+        Ordered list of ``(ImportedMaterialSlotName, material_import_name)``
+        tuples, or ``None`` if parsing fails.
     """
     from .properties import read_properties
 
@@ -670,7 +670,7 @@ def _parse_static_materials(pkg: Package) -> Optional[Dict[str, str]]:
 
 
 def _parse_static_materials_at(data: bytes, offset: int,
-                               pkg: Package) -> Optional[Dict[str, str]]:
+                               pkg: Package) -> Optional[List[Tuple[str, str]]]:
     """Try to parse the StaticMaterials array property at *offset*."""
     from .properties import read_properties
 
@@ -711,7 +711,7 @@ def _parse_static_materials_at(data: bytes, offset: int,
         return None
 
     # Parse each FStaticMaterial struct (properties until "None")
-    result: Dict[str, str] = {}
+    result: List[Tuple[str, str]] = []
     for _ in range(arr_count):
         elem_props = read_properties(r, pkg.name_map, pkg.file_version_ue5)
         imported_slot_name = elem_props.get('ImportedMaterialSlotName')
@@ -722,7 +722,8 @@ def _parse_static_materials_at(data: bytes, offset: int,
         if isinstance(material_interface, int) and material_interface < 0:
             imp_idx = -material_interface - 1
             if 0 <= imp_idx < len(pkg.imports):
-                result[imported_slot_name] = pkg.imports[imp_idx].object_name
+                result.append(
+                    (imported_slot_name, pkg.imports[imp_idx].object_name))
 
     return result if result else None
 
@@ -833,9 +834,12 @@ class StaticMesh:
         self.triangles: List[Tuple[int, int, int, int]] = []  # (vi0, vi1, vi2, material_index)
         self.vi_to_vertex: List[int] = []
         self.material_slot_names: Optional[List[Optional[str]]] = None
-        # Real mapping from ImportedMaterialSlotName → material import name,
-        # parsed from the StaticMaterials export property.
-        self.material_slots: Optional[Dict[str, str]] = None
+        # Ordered list of (ImportedMaterialSlotName, material_import_name)
+        # tuples parsed from the StaticMaterials export property, indexed by
+        # material slot index.
+        self.material_slots: Optional[List[Tuple[str, str]]] = None
+        # SectionInfoMap: maps polygon group index → material slot index.
+        self.section_info_map: Optional[List[int]] = None
 
     @classmethod
     def from_package(cls, pkg: Package) -> Optional['StaticMesh']:
@@ -891,17 +895,20 @@ class StaticMesh:
                     section_map = _parse_section_info_map(
                         exp_reader.data, pkg.name_map,
                         len(mesh.material_slot_names))
+                    mesh.section_info_map = section_map
                     if section_map is not None:
-                        # ordered_slots[i] = ImportedMaterialSlotName of
-                        # StaticMaterials[i] (dict preserves insertion order)
-                        ordered_slots = list(mesh.material_slots.keys())
+                        # section_map[pg_idx] = material slot index into
+                        # StaticMaterials; mesh.material_slots[slot_idx] =
+                        # (slot_name, material_name).  Remap material_slot_names
+                        # so each PG gets the ImportedMaterialSlotName from the
+                        # correct StaticMaterials entry.
                         remapped: List[Optional[str]] = []
                         for pg_idx in range(len(mesh.material_slot_names)):
                             if pg_idx < len(section_map):
                                 mat_idx = section_map[pg_idx]
-                                if mat_idx < len(ordered_slots):
+                                if mat_idx < len(mesh.material_slots):
                                     remapped.append(
-                                        ordered_slots[mat_idx])
+                                        mesh.material_slots[mat_idx][0])
                                     continue
                             remapped.append(
                                 mesh.material_slot_names[pg_idx])
