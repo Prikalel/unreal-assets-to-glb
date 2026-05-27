@@ -2,3 +2,5 @@ UnrealEngine-5.5.0-release/
 Input/
 Export/
 *.pyc
+debug_*.py
+debug_*.png

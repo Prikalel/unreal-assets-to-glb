@@ -716,6 +716,100 @@ def _parse_static_materials_at(data: bytes, offset: int,
     return result if result else None
 
 
+def _parse_section_info_map(data: bytes, name_map: list,
+                            num_sections: int) -> Optional[List[int]]:
+    """Parse the SectionInfoMap to extract MaterialIndex overrides for LOD 0.
+
+    UE5's ``FMeshSectionInfoMap`` stores a ``Map<UInt32, FMeshSectionInfo>``
+    keyed by ``GetMeshMaterialKey(LOD, Section) = (LOD << 16) | Section``.
+    For LOD 0 the keys are simply 0, 1, 2, … and the map is populated in
+    insertion order (section 0 first).  Each ``FMeshSectionInfo`` contains a
+    ``MaterialIndex`` *IntProperty* that overrides which entry in the
+    ``StaticMaterials`` array the section should use.
+
+    Returns a list of *MaterialIndex* values for the first *num_sections*
+    sections of LOD 0, or ``None`` on failure.
+    """
+    if num_sections <= 0:
+        return None
+
+    # Locate required FName indices
+    sim_idx = sm_idx = mi_idx = None
+    for i, n in enumerate(name_map):
+        if n == 'SectionInfoMap':
+            sim_idx = i
+        elif n == 'StaticMaterials':
+            sm_idx = i
+        elif n == 'MaterialIndex':
+            mi_idx = i
+    if sim_idx is None or mi_idx is None:
+        return None
+
+    # Find SectionInfoMap property start
+    target = struct.pack('<ii', sim_idx, 0)
+    sim_offset = data.find(target)
+    if sim_offset < 0:
+        return None
+
+    # Determine end of SectionInfoMap range (StaticMaterials comes after)
+    search_end = len(data)
+    if sm_idx is not None:
+        target = struct.pack('<ii', sm_idx, 0)
+        sm_offset = data.find(target, sim_offset + 8)
+        if sm_offset >= 0:
+            search_end = sm_offset
+
+    # Scan for MaterialIndex FName occurrences and extract IntProperty values
+    mi_pattern = struct.pack('<ii', mi_idx, 0)
+    material_indices: List[int] = []
+    offset = sim_offset
+    while offset < search_end and len(material_indices) < num_sections:
+        idx = data.find(mi_pattern, offset, search_end)
+        if idx == -1:
+            break
+
+        # After the MaterialIndex FName (8 bytes) comes the type tree
+        pos = idx + 8
+        if pos + 12 > len(data):
+            break
+
+        type_idx = struct.unpack_from('<i', data, pos)[0]
+        type_name = name_map[type_idx] if 0 <= type_idx < len(name_map) else ''
+        pos += 8  # type FName
+        inner_count = struct.unpack_from('<i', data, pos)[0]
+        pos += 4  # inner_count
+
+        if type_name == 'IntProperty' and inner_count == 0:
+            if pos + 5 > len(data):
+                break
+            size = struct.unpack_from('<i', data, pos)[0]
+            pos += 4  # size
+            flags = data[pos]
+            pos += 1  # flags
+
+            if flags & 0x01:  # HasArrayIndex
+                pos += 4
+            if flags & 0x02:  # HasPropertyGuid
+                pos += 16
+            if flags & 0x04:  # HasPropertyExtensions
+                if pos >= len(data):
+                    break
+                ext = data[pos]
+                pos += 1
+                if ext & 0x01:
+                    pos += 1 + 4
+
+            if size >= 4 and pos + 4 <= len(data):
+                value = struct.unpack_from('<i', data, pos)[0]
+                material_indices.append(value)
+
+        offset = idx + 1
+
+    if len(material_indices) >= num_sections:
+        return material_indices[:num_sections]
+    return None
+
+
 # ---------------------------------------------------------------------------
 # StaticMesh class
 # ---------------------------------------------------------------------------
@@ -771,6 +865,36 @@ class StaticMesh:
 
         # Parse real material slot mapping from export data
         mesh.material_slots = _parse_static_materials(pkg)
+
+        # Apply SectionInfoMap overrides — the map can remap which
+        # StaticMaterials entry each polygon group (section) uses.
+        if mesh.material_slots and mesh.material_slot_names:
+            sm_export_idx = None
+            for i in range(pkg.export_count):
+                if pkg.get_export_class_name(i) == 'StaticMesh':
+                    sm_export_idx = i
+                    break
+            if sm_export_idx is not None:
+                exp_reader = pkg.get_export_data(sm_export_idx)
+                if exp_reader is not None:
+                    section_map = _parse_section_info_map(
+                        exp_reader.data, pkg.name_map,
+                        len(mesh.material_slot_names))
+                    if section_map is not None:
+                        # ordered_slots[i] = ImportedMaterialSlotName of
+                        # StaticMaterials[i] (dict preserves insertion order)
+                        ordered_slots = list(mesh.material_slots.keys())
+                        remapped: List[Optional[str]] = []
+                        for pg_idx in range(len(mesh.material_slot_names)):
+                            if pg_idx < len(section_map):
+                                mat_idx = section_map[pg_idx]
+                                if mat_idx < len(ordered_slots):
+                                    remapped.append(
+                                        ordered_slots[mat_idx])
+                                    continue
+                            remapped.append(
+                                mesh.material_slot_names[pg_idx])
+                        mesh.material_slot_names = remapped
 
         return mesh
 
