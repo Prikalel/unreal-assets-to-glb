@@ -11,7 +11,7 @@ html, body { width: 100%; height: 100%; overflow: hidden; font-family: 'Segoe UI
 
 /* ---- Left Sidebar ---- */
 #sidebar {
-    width: 320px; min-width: 320px; height: 100%;
+    width: 340px; min-width: 340px; height: 100%;
     background: #1a1a2e; border-right: 1px solid #2a2a4a;
     display: flex; flex-direction: column; overflow: hidden;
     user-select: none;
@@ -29,14 +29,42 @@ html, body { width: 100%; height: 100%; overflow: hidden; font-family: 'Segoe UI
 #actor-list::-webkit-scrollbar-track { background: #1a1a2e; }
 #actor-list::-webkit-scrollbar-thumb { background: #3a3a5a; border-radius: 3px; }
 
-.actor-item {
-    padding: 8px 16px; cursor: pointer; border-bottom: 1px solid #222244;
+/* Tree items */
+.tree-node { }
+.tree-header {
+    display: flex; align-items: center; padding: 5px 8px;
+    cursor: pointer; border-bottom: 1px solid #1a1a30;
     transition: background 0.15s;
+    min-height: 28px;
 }
-.actor-item:hover { background: #22224a; }
-.actor-item.selected { background: #0f3460; }
-.actor-item .actor-name { font-size: 13px; color: #e0e0ff; font-weight: 500; }
-.actor-item .actor-mesh { font-size: 11px; color: #8888aa; margin-top: 2px; }
+.tree-header:hover { background: #22224a; }
+.tree-header.selected { background: #0f3460; }
+.tree-toggle {
+    display: inline-block; width: 16px; font-size: 10px;
+    color: #6666aa; cursor: pointer; flex-shrink: 0;
+    transition: transform 0.15s;
+    text-align: center;
+}
+.tree-toggle.expanded { transform: rotate(90deg); }
+.tree-spacer { display: inline-block; width: 16px; flex-shrink: 0; }
+.tree-children { }
+
+.actor-name {
+    font-size: 12px; color: #e0e0ff; font-weight: 500;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.actor-mesh {
+    font-size: 10px; color: #6666aa; margin-left: 8px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.group-name {
+    font-size: 12px; color: #8888cc; font-weight: 600;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.actor-loc {
+    font-size: 10px; color: #555577; margin-left: auto; flex-shrink: 0;
+    padding-left: 6px;
+}
 
 /* ---- Transform Section ---- */
 .transform-section {
@@ -115,7 +143,7 @@ html, body { width: 100%; height: 100%; overflow: hidden; font-family: 'Segoe UI
 
         <div id="selected-transform" style="display:none;">
             <div class="transform-section">
-                <h3>Location</h3>
+                <h3>World Location</h3>
                 <div class="transform-row">
                     <label>X</label><input type="number" step="1" id="loc-x">
                     <label>Y</label><input type="number" step="1" id="loc-y">
@@ -182,6 +210,7 @@ let scene, camera, renderer;
 let sceneData = null;
 let actorObjects = {};      // actorName → THREE.Group
 let actorDataMap = {};       // actorName → actor data from API
+let actorHeaders = {};       // actorName → tree header DOM element
 let selectedActor = null;
 let meshCache = {};          // meshName → Promise<THREE.BufferGeometry>
 let textureCache = {};       // texName → Promise<THREE.Texture>
@@ -225,16 +254,6 @@ function ueToThreeMatrix(loc, rot, scale) {
     const cp = Math.cos(pRad), sp = Math.sin(pRad);
     const cy = Math.cos(yRad), sy = Math.sin(yRad);
     const cr = Math.cos(rRad), sr = Math.sin(rRad);
-
-    // UE rotation: R = Rz(yaw) * Ry(pitch) * Rx(roll)
-    // Column-major for Three.js Matrix4.set():
-    //   set( m00, m01, m02, m03,  m10, m11, m12, m13,  m20, m21, m22, m23,  m30, m31, m32, m33 )
-    // But THREE.Matrix4.set() takes ROW-MAJOR arguments, stored column-major internally.
-
-    // Rotation matrix in UE space (row-major):
-    // [ cy*cp,  cy*sp*sr - sy*cr,  cy*sp*cr + sy*sr ]
-    // [ sy*cp,  sy*sp*sr + cy*cr,  sy*sp*cr - cy*sr ]
-    // [ -sp,    cp*sr,             cp*cr             ]
 
     // Build as 4x4 in UE space (row-major for set())
     const m = new THREE.Matrix4();
@@ -283,22 +302,13 @@ function threeToUETransform(obj) {
     scl.setFromMatrixScale(ueMat);
 
     // Extract rotation as UE FRotator
-    // Remove scale from the 3x3 part
     const rotMat = new THREE.Matrix4();
     rotMat.extractRotation(ueMat);
     const te = rotMat.elements;
-    // Row-major interpretation of the rotation:
-    // R[0][0]=te[0], R[0][1]=te[4], R[0][2]=te[8]
-    // R[1][0]=te[1], R[1][1]=te[5], R[1][2]=te[9]
-    // R[2][0]=te[2], R[2][1]=te[6], R[2][2]=te[10]
     const r00=te[0], r01=te[4], r02=te[8];
     const r10=te[1], r11=te[5], r12=te[9];
     const r20=te[2], r21=te[6], r22=te[10];
 
-    // UE FRotator from rotation matrix:
-    // pitch = asin(-R[2][0])  (but careful with gimbal lock)
-    // yaw   = atan2(R[1][0], R[0][0])
-    // roll  = atan2(R[2][1], R[2][2])
     let pitchDeg, yawDeg, rollDeg;
     const spVal = -r20;
     if (Math.abs(spVal) < 0.99999) {
@@ -358,8 +368,7 @@ function parseOBJ(text) {
     const hasNormals = normals.length > 0 && faces[0] && faces[0][0].vn >= 0;
     const hasUVs = uvs.length > 0 && faces[0] && faces[0][0].vt >= 0;
 
-    // Build indexed or non-indexed BufferGeometry
-    // For simplicity, build non-indexed with all attributes
+    // Build non-indexed BufferGeometry
     const vertCount = faces.length * 3;
     const posArr = new Float32Array(vertCount * 3);
     const normArr = hasNormals ? new Float32Array(vertCount * 3) : null;
@@ -507,8 +516,8 @@ async function buildScene() {
     const actors = sceneData.actors;
     loadingText.textContent = `Loading ${actors.length} actors…`;
 
-    // Populate actor list
-    populateActorList(actors);
+    // Populate actor tree
+    populateActorTree(actors);
 
     // Group actors by mesh name for efficient loading
     const meshNames = [...new Set(actors.map(a => a.mesh_name))];
@@ -602,7 +611,7 @@ function finalizeActor(actor, geom, material) {
     group.add(mesh);
     group.name = actor.name;
 
-    // Apply UE transform
+    // Apply UE world transform (already in world space from the server)
     const mat4 = ueToThreeMatrix(actor.location, actor.rotation, actor.scale);
     group.matrix.copy(mat4);
     group.matrixAutoUpdate = false;
@@ -614,20 +623,138 @@ function finalizeActor(actor, geom, material) {
 }
 
 // ===========================================================================
-// Actor list UI
+// Actor tree UI (parent-child hierarchy)
 // ===========================================================================
-function populateActorList(actors) {
+function populateActorTree(actors) {
     const list = document.getElementById('actor-list');
     list.innerHTML = '';
 
+    // Build name → actor data map
+    const actorMap = {};
     for (const actor of actors) {
-        const div = document.createElement('div');
-        div.className = 'actor-item';
-        div.dataset.name = actor.name;
-        div.innerHTML = `<div class="actor-name">${actor.name}</div>
-                         <div class="actor-mesh">${actor.mesh_name}${actor.texture ? ' 🎨' + actor.texture : ''}</div>`;
-        div.addEventListener('click', () => selectActor(actor.name));
-        list.appendChild(div);
+        actorMap[actor.name] = actor;
+    }
+
+    // Build parent → children map
+    const childrenOf = {};  // parentName → [actor, ...]
+    const rootItems = [];   // items at root level (actors or virtual groups)
+
+    // Track which virtual groups we've already added to rootItems
+    const virtualGroupsAdded = new Set();
+
+    for (const actor of actors) {
+        if (actor.parent) {
+            if (!childrenOf[actor.parent]) childrenOf[actor.parent] = [];
+            childrenOf[actor.parent].push(actor);
+
+            // If parent is not an actor in our list, create a virtual group at root
+            if (!actorMap[actor.parent] && !virtualGroupsAdded.has(actor.parent)) {
+                virtualGroupsAdded.add(actor.parent);
+                rootItems.push({ name: actor.parent, isVirtualGroup: true });
+            }
+        } else {
+            rootItems.push(actor);
+        }
+    }
+
+    // Sort root items: virtual groups first, then actors by name
+    rootItems.sort((a, b) => {
+        if (a.isVirtualGroup && !b.isVirtualGroup) return -1;
+        if (!a.isVirtualGroup && b.isVirtualGroup) return 1;
+        return a.name.localeCompare(b.name);
+    });
+
+    // Sort children of each parent by name
+    for (const key in childrenOf) {
+        childrenOf[key].sort((a, b) => a.name.localeCompare(b.name));
+    }
+
+    // Build tree recursively
+    function buildTreeNode(item, container, depth) {
+        const node = document.createElement('div');
+        node.className = 'tree-node';
+
+        const children = childrenOf[item.name] || [];
+        const hasChildren = children.length > 0;
+
+        const header = document.createElement('div');
+        header.className = 'tree-header';
+        header.style.paddingLeft = (depth * 16 + 8) + 'px';
+
+        // Toggle button
+        if (hasChildren) {
+            const toggle = document.createElement('span');
+            toggle.className = 'tree-toggle expanded';
+            toggle.textContent = '\u25B6'; // ▶
+            toggle.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const childContainer = node.querySelector(':scope > .tree-children');
+                if (childContainer) {
+                    const isHidden = childContainer.style.display === 'none';
+                    childContainer.style.display = isHidden ? 'block' : 'none';
+                    toggle.className = isHidden ? 'tree-toggle expanded' : 'tree-toggle';
+                }
+            });
+            header.appendChild(toggle);
+        } else {
+            const spacer = document.createElement('span');
+            spacer.className = 'tree-spacer';
+            header.appendChild(spacer);
+        }
+
+        if (item.isVirtualGroup) {
+            // Virtual group (parent actor not in scene)
+            const nameSpan = document.createElement('span');
+            nameSpan.className = 'group-name';
+            nameSpan.textContent = '\uD83D\uDCC1 ' + item.name;
+            header.appendChild(nameSpan);
+
+            const countSpan = document.createElement('span');
+            countSpan.className = 'actor-mesh';
+            countSpan.textContent = `(${children.length})`;
+            header.appendChild(countSpan);
+        } else {
+            // Real actor
+            const actor = item;
+            const nameSpan = document.createElement('span');
+            nameSpan.className = 'actor-name';
+            // Show display name (part after last "/") for composed actors
+            const displayName = actor.name.includes('/') ? actor.name.split('/').pop() : actor.name;
+            nameSpan.textContent = displayName;
+            header.appendChild(nameSpan);
+
+            const meshSpan = document.createElement('span');
+            meshSpan.className = 'actor-mesh';
+            meshSpan.textContent = actor.mesh_name;
+            header.appendChild(meshSpan);
+
+            const locSpan = document.createElement('span');
+            locSpan.className = 'actor-loc';
+            locSpan.textContent = `${actor.location.x.toFixed(0)}, ${actor.location.y.toFixed(0)}, ${actor.location.z.toFixed(0)}`;
+            header.appendChild(locSpan);
+
+            header.dataset.name = actor.name;
+            actorHeaders[actor.name] = header;
+            header.addEventListener('click', () => selectActor(actor.name));
+        }
+
+        node.appendChild(header);
+
+        // Children
+        if (hasChildren) {
+            const childContainer = document.createElement('div');
+            childContainer.className = 'tree-children';
+            for (const child of children) {
+                buildTreeNode(child, childContainer, depth + 1);
+            }
+            node.appendChild(childContainer);
+        }
+
+        container.appendChild(node);
+    }
+
+    for (const item of rootItems) {
+        buildTreeNode(item, list, 0);
     }
 }
 
@@ -642,8 +769,8 @@ function selectActor(name) {
                 }
             });
         }
-        const prevItem = document.querySelector(`.actor-item[data-name="${CSS.escape(selectedActor)}"]`);
-        if (prevItem) prevItem.classList.remove('selected');
+        const prevHeader = actorHeaders[selectedActor];
+        if (prevHeader) prevHeader.classList.remove('selected');
     }
 
     selectedActor = name;
@@ -658,10 +785,10 @@ function selectActor(name) {
         });
     }
 
-    const item = document.querySelector(`.actor-item[data-name="${CSS.escape(name)}"]`);
-    if (item) {
-        item.classList.add('selected');
-        item.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    const header = actorHeaders[name];
+    if (header) {
+        header.classList.add('selected');
+        header.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
     }
 
     // Show transform
@@ -707,7 +834,7 @@ function onTransformInput() {
     actor.scale.y = parseFloat(document.getElementById('scl-y').value) || 1;
     actor.scale.z = parseFloat(document.getElementById('scl-z').value) || 1;
 
-    // Update Three.js object
+    // Update Three.js object (world position, independent of parent)
     const obj = actorObjects[selectedActor];
     if (obj) {
         const mat4 = ueToThreeMatrix(actor.location, actor.rotation, actor.scale);

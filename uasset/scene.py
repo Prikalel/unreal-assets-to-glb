@@ -255,7 +255,7 @@ def build_preview_scene(level_data: LevelData,
                            dtype=np.uint8)
             mesh.visual = trimesh.visual.ColorVisuals(mesh, vertex_colors=gray)
 
-        transform = ue_transform_to_matrix(actor.location, actor.rotation, actor.scale)
+        transform = ue_transform_to_matrix(actor.world_location, actor.world_rotation, actor.world_scale)
         if not np.all(np.isfinite(transform)):
             transform = np.eye(4)
 
@@ -265,9 +265,9 @@ def build_preview_scene(level_data: LevelData,
         actors_info.append(ActorInfo(
             name=actor.name,
             mesh_name=actor.mesh_name,
-            location=actor.location,
-            rotation=actor.rotation,
-            scale=actor.scale,
+            location=actor.world_location,
+            rotation=actor.world_rotation,
+            scale=actor.world_scale,
         ))
 
     logger.info(f"Scene built with {len(scene.geometry)} objects")

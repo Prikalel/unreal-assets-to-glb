@@ -4,8 +4,11 @@ Parses .umap files (same format as .uasset) to extract actor placements
 and static mesh references for level preview.
 """
 import os
-from typing import List, Optional, Dict, Tuple
+import math
+from typing import List, Optional, Dict, Tuple, Set
 from dataclasses import dataclass, field
+
+import numpy as np
 
 from .package import Package
 from .properties import read_properties
@@ -20,11 +23,15 @@ class LevelActor:
     """Represents an actor placed in a level."""
     name: str = ""               # Actor label or object name
     mesh_name: str = ""          # Static mesh asset name (e.g., "SM_Barrel1") or ""
-    location: tuple = (0.0, 0.0, 0.0)   # (x, y, z) in UE space
-    rotation: tuple = (0.0, 0.0, 0.0)   # (pitch, yaw, roll) in degrees
-    scale: tuple = (1.0, 1.0, 1.0)      # (x, y, z)
+    location: tuple = (0.0, 0.0, 0.0)   # (x, y, z) local/relative in UE space
+    rotation: tuple = (0.0, 0.0, 0.0)   # (pitch, yaw, roll) local in degrees
+    scale: tuple = (1.0, 1.0, 1.0)      # (x, y, z) local
     parent: str = ""             # Parent actor name or ""
     component_props: dict = field(default_factory=dict)  # Raw component properties
+    # World-space transforms (computed from parent chain)
+    world_location: tuple = (0.0, 0.0, 0.0)
+    world_rotation: tuple = (0.0, 0.0, 0.0)
+    world_scale: tuple = (1.0, 1.0, 1.0)
 
 
 @dataclass
@@ -73,6 +80,77 @@ def resolve_import_path(pkg: Package, index: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# UE transform math (pure UE space, no coordinate conversion)
+# ---------------------------------------------------------------------------
+
+def _rotator_to_matrix(pitch: float, yaw: float, roll: float) -> np.ndarray:
+    """Convert UE FRotator (degrees) to 3x3 rotation matrix."""
+    p = math.radians(pitch)
+    y = math.radians(yaw)
+    r = math.radians(roll)
+
+    cp, sp = math.cos(p), math.sin(p)
+    cy, sy = math.cos(y), math.sin(y)
+    cr, sr = math.cos(r), math.sin(r)
+
+    R = np.array([
+        [cy * cp,  cy * sp * sr - sy * cr,  cy * sp * cr + sy * sr],
+        [sy * cp,  sy * sp * sr + cy * cr,  sy * sp * cr - cy * sr],
+        [-sp,      cp * sr,                 cp * cr],
+    ])
+    return R
+
+
+def _make_ue_transform(location: tuple, rotation: tuple, scale: tuple) -> np.ndarray:
+    """Build 4x4 transform matrix in UE space (no coordinate conversion)."""
+    R = _rotator_to_matrix(*rotation)
+    s = np.array([scale[0], scale[1], scale[2]])
+
+    T = np.eye(4, dtype=float)
+    T[:3, :3] = R * s[np.newaxis, :]
+    T[0, 3] = location[0]
+    T[1, 3] = location[1]
+    T[2, 3] = location[2]
+
+    return T
+
+
+def _matrix_to_rotator(R: np.ndarray) -> tuple:
+    """Extract UE FRotator (degrees) from 3x3 rotation matrix."""
+    sp = -R[2, 0]
+    if abs(sp) < 0.99999:
+        pitch = math.asin(sp)
+        yaw = math.atan2(R[1, 0], R[0, 0])
+        roll = math.atan2(R[2, 1], R[2, 2])
+    else:
+        pitch = math.copysign(math.pi / 2, sp)
+        yaw = math.atan2(-R[0, 1], R[1, 1])
+        roll = 0.0
+    return (math.degrees(pitch), math.degrees(yaw), math.degrees(roll))
+
+
+def _decompose_ue_transform(M: np.ndarray) -> tuple:
+    """Decompose 4x4 UE transform matrix to (location, rotation, scale)."""
+    loc = (float(M[0, 3]), float(M[1, 3]), float(M[2, 3]))
+
+    # Extract scale as column norms
+    sx = float(np.linalg.norm(M[:3, 0]))
+    sy = float(np.linalg.norm(M[:3, 1]))
+    sz = float(np.linalg.norm(M[:3, 2]))
+
+    # Avoid zero scale
+    sx = max(sx, 1e-7)
+    sy = max(sy, 1e-7)
+    sz = max(sz, 1e-7)
+
+    # Normalize columns to get rotation matrix
+    R = M[:3, :3] / np.array([sx, sy, sz])[np.newaxis, :]
+
+    rot = _matrix_to_rotator(R)
+    return loc, rot, (sx, sy, sz)
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -113,9 +191,6 @@ def _read_export_properties(pkg: Package, export_index: int) -> dict:
     expected_end = entry.script_serialization_end_offset if entry.script_serialization_end_offset > 0 else None
 
     # Try common offsets where property tags typically start:
-    # Offset 0: no native prefix (rare)
-    # Offset 1: 1-byte SerializationControl prefix (most common)
-    # Then scan further if needed (up to 256 bytes of native prefix)
     best_props = {}
     best_off = -1
     data_len = len(data.data)
@@ -132,9 +207,7 @@ def _read_export_properties(pkg: Package, export_index: int) -> dict:
             # If we know the expected end position, validate against it
             if expected_end is not None and expected_end > 0:
                 if end_pos == expected_end:
-                    # Perfect match — this is the correct offset
                     return props
-                # Close match (within 8 bytes — might be trailing "None" alignment)
                 if abs(end_pos - expected_end) <= 8 and len(props) > len(best_props):
                     best_props = props
                     best_off = off
@@ -145,7 +218,6 @@ def _read_export_properties(pkg: Package, export_index: int) -> dict:
                 best_props = props
                 best_off = off
 
-            # If we found 2+ properties and no expected_end, good enough
             if len(props) >= 2 and expected_end is None:
                 break
 
@@ -175,7 +247,6 @@ def parse_level(filepath: str) -> LevelData:
     export_props: Dict[int, dict] = {}
     for i in range(pkg.export_count):
         class_name = pkg.get_export_class_name(i)
-        # Only read properties for relevant classes to save time
         if class_name in ("StaticMeshActor", "StaticMeshComponent",
                           "SceneComponent", "ModelComponent", "Actor",
                           "PlayerStart", "CameraActor", "PlayerStartPIE",
@@ -192,7 +263,77 @@ def parse_level(filepath: str) -> LevelData:
     for i in range(pkg.export_count):
         export_classes[i] = pkg.get_export_class_name(i)
 
-    # Phase 2.5: Find camera / player start actors for initial camera position
+    # Phase 2.5: Build component info map for parent-chain transform resolution.
+    comp_info: Dict[int, dict] = {}  # comp_export_idx → {loc, rot, scl, parent_comp_idx}
+    for i in range(pkg.export_count):
+        class_name = export_classes.get(i)
+        if class_name in ("StaticMeshComponent", "SceneComponent",
+                          "ModelComponent", "SpringArmComponent",
+                          "CameraComponent"):
+            props = export_props.get(i)
+            if props is None:
+                continue
+            loc = _get_vector(props, "RelativeLocation", (0.0, 0.0, 0.0))
+            rot = _get_rotator(props, "RelativeRotation", (0.0, 0.0, 0.0))
+            scl = _get_vector(props, "RelativeScale3D", (1.0, 1.0, 1.0))
+            parent_comp_idx = -1
+            attach_parent = props.get("AttachParent")
+            if isinstance(attach_parent, int) and attach_parent > 0:
+                parent_comp_idx = attach_parent - 1
+            comp_info[i] = {
+                'loc': loc, 'rot': rot, 'scl': scl,
+                'parent_comp_idx': parent_comp_idx,
+            }
+
+    # Build component children map: parent_comp_idx → [child_comp_idx, ...]
+    comp_children_map: Dict[int, List[int]] = {}
+    for ci, info in comp_info.items():
+        pidx = info['parent_comp_idx']
+        if pidx >= 0:
+            comp_children_map.setdefault(pidx, []).append(ci)
+
+    # Build component export index → owning actor label map.
+    comp_to_actor: Dict[int, str] = {}
+    _actor_classes = ("StaticMeshActor", "Actor", "PlayerStart",
+                      "CameraActor", "PlayerStartPIE")
+    for i in range(pkg.export_count):
+        if export_classes.get(i) not in _actor_classes:
+            continue
+        actor_props = export_props.get(i, {})
+        root_comp_idx = actor_props.get("RootComponent")
+        if isinstance(root_comp_idx, int) and root_comp_idx > 0:
+            comp_idx = root_comp_idx - 1
+            name = actor_props.get("ActorLabel",
+                                   actor_props.get("Name",
+                                                   pkg.exports[i].object_name))
+            if isinstance(name, bytes):
+                name = pkg.exports[i].object_name
+            comp_to_actor[comp_idx] = name
+
+    # World-transform cache
+    _wt_cache: Dict[int, np.ndarray] = {}
+
+    def _get_world_transform(comp_idx: int, depth: int = 0) -> np.ndarray:
+        if depth > 32:
+            return np.eye(4)
+        if comp_idx in _wt_cache:
+            return _wt_cache[comp_idx]
+        info = comp_info.get(comp_idx)
+        if info is None:
+            result = np.eye(4)
+            _wt_cache[comp_idx] = result
+            return result
+        local = _make_ue_transform(info['loc'], info['rot'], info['scl'])
+        pidx = info['parent_comp_idx']
+        if pidx >= 0 and pidx in comp_info:
+            parent_world = _get_world_transform(pidx, depth + 1)
+            result = parent_world @ local
+        else:
+            result = local
+        _wt_cache[comp_idx] = result
+        return result
+
+    # Phase 2.7: Find camera / player start
     camera_location = (0.0, 0.0, 0.0)
     camera_rotation = (0.0, 0.0, 0.0)
     has_camera = False
@@ -208,21 +349,14 @@ def parse_level(filepath: str) -> LevelData:
         comp_export_idx = root_comp_idx - 1 if root_comp_idx > 0 else -1
         if comp_export_idx < 0 or comp_export_idx >= pkg.export_count:
             continue
-        comp_props = export_props.get(comp_export_idx)
-        if comp_props is None:
-            try:
-                comp_props = _read_export_properties(pkg, comp_export_idx)
-            except Exception:
-                comp_props = {}
-        if comp_props:
-            loc = _get_vector(comp_props, "RelativeLocation", (0.0, 0.0, 0.0))
-            rot = _get_rotator(comp_props, "RelativeRotation", (0.0, 0.0, 0.0))
-            camera_location = loc
-            camera_rotation = rot
-            has_camera = True
-            break  # Use first camera found
+        world_mat = _get_world_transform(comp_export_idx)
+        world_loc, world_rot, _ = _decompose_ue_transform(world_mat)
+        camera_location = world_loc
+        camera_rotation = world_rot
+        has_camera = True
+        break
 
-    # Phase 3: Find StaticMeshActor exports and resolve their components
+    # Phase 3: Find StaticMeshActor exports (standalone actors)
     actors: List[LevelActor] = []
 
     for i in range(pkg.export_count):
@@ -236,17 +370,14 @@ def parse_level(filepath: str) -> LevelData:
         if isinstance(actor_name, bytes):
             actor_name = pkg.exports[i].object_name
 
-        # Get RootComponent → FPackageIndex
         root_comp_idx = actor_props.get("RootComponent")
         if not isinstance(root_comp_idx, int) or root_comp_idx == 0:
             continue
 
-        # Resolve RootComponent to export index
         comp_export_idx = root_comp_idx - 1 if root_comp_idx > 0 else -1
         if comp_export_idx < 0 or comp_export_idx >= pkg.export_count:
             continue
 
-        # Read component properties (might already be cached)
         comp_props = export_props.get(comp_export_idx)
         if comp_props is None:
             try:
@@ -257,26 +388,26 @@ def parse_level(filepath: str) -> LevelData:
         if not comp_props:
             continue
 
-        # Extract transform
         location = _get_vector(comp_props, "RelativeLocation", (0.0, 0.0, 0.0))
         rotation = _get_rotator(comp_props, "RelativeRotation", (0.0, 0.0, 0.0))
         scale = _get_vector(comp_props, "RelativeScale3D", (1.0, 1.0, 1.0))
 
-        # Extract StaticMesh reference
         mesh_fp_idx = comp_props.get("StaticMesh")
         mesh_name = ""
         if isinstance(mesh_fp_idx, int) and mesh_fp_idx != 0:
             mesh_name = resolve_package_index(pkg, mesh_fp_idx)
 
-        # Skip actors without a valid mesh reference
         if not mesh_name:
             continue
 
-        # Resolve parent from AttachParent
-        parent_name = ""
+        world_mat = _get_world_transform(comp_export_idx)
+        world_loc, world_rot, world_scl = _decompose_ue_transform(world_mat)
+
+        parent_actor_name = ""
         attach_parent_idx = comp_props.get("AttachParent")
-        if isinstance(attach_parent_idx, int) and attach_parent_idx != 0:
-            parent_name = resolve_package_index(pkg, attach_parent_idx)
+        if isinstance(attach_parent_idx, int) and attach_parent_idx > 0:
+            parent_comp_idx = attach_parent_idx - 1
+            parent_actor_name = comp_to_actor.get(parent_comp_idx, "")
 
         actor = LevelActor(
             name=actor_name,
@@ -284,10 +415,102 @@ def parse_level(filepath: str) -> LevelData:
             location=location,
             rotation=rotation,
             scale=scale,
-            parent=parent_name,
+            parent=parent_actor_name,
             component_props=comp_props,
+            world_location=world_loc,
+            world_rotation=world_rot,
+            world_scale=world_scl,
         )
         actors.append(actor)
+
+    # Phase 4: Process composed actors (Actor exports with mesh sub-components).
+    # These are empty Actor exports that serve as containers for multiple
+    # StaticMeshComponents attached in a hierarchy.
+    _composed_names: Set[str] = set(a.name for a in actors)
+
+    for i in range(pkg.export_count):
+        if export_classes.get(i) != "Actor":
+            continue
+        actor_props = export_props.get(i, {})
+        actor_label = actor_props.get("ActorLabel", pkg.exports[i].object_name)
+        if isinstance(actor_label, bytes):
+            actor_label = pkg.exports[i].object_name
+
+        root_comp_idx = actor_props.get("RootComponent")
+        if not isinstance(root_comp_idx, int) or root_comp_idx == 0:
+            continue
+        root_comp_export_idx = root_comp_idx - 1
+
+        # Walk the component tree from root, find all StaticMeshComponents
+        _name_counter: Dict[str, int] = {}
+
+        def _walk_composed_tree(comp_idx: int, parent_name: str, depth: int = 0):
+            if depth > 32:
+                return
+            children = comp_children_map.get(comp_idx, [])
+            for child_idx in children:
+                child_cn = export_classes.get(child_idx)
+                if child_cn not in ("StaticMeshComponent", "SceneComponent",
+                                    "ModelComponent"):
+                    continue
+
+                child_props = export_props.get(child_idx)
+                if child_props is None:
+                    continue
+
+                mesh_fp_idx = child_props.get("StaticMesh")
+                mesh_name = ""
+                if isinstance(mesh_fp_idx, int) and mesh_fp_idx != 0:
+                    mesh_name = resolve_package_index(pkg, mesh_fp_idx)
+
+                comp_obj_name = pkg.exports[child_idx].object_name
+
+                if mesh_name:
+                    world_mat = _get_world_transform(child_idx)
+                    world_loc, world_rot, world_scl = _decompose_ue_transform(world_mat)
+
+                    info = comp_info.get(child_idx)
+                    loc = info['loc'] if info else (0.0, 0.0, 0.0)
+                    rot = info['rot'] if info else (0.0, 0.0, 0.0)
+                    scl = info['scl'] if info else (1.0, 1.0, 1.0)
+
+                    # Ensure unique name
+                    base_name = f"{actor_label}/{comp_obj_name}"
+                    if base_name in _name_counter:
+                        _name_counter[base_name] += 1
+                        unique_name = f"{base_name}_{_name_counter[base_name]}"
+                    else:
+                        _name_counter[base_name] = 0
+                        unique_name = base_name
+
+                    # Make sure it's globally unique
+                    if unique_name in _composed_names:
+                        idx = 2
+                        while f"{unique_name}_{idx}" in _composed_names:
+                            idx += 1
+                        unique_name = f"{unique_name}_{idx}"
+
+                    _composed_names.add(unique_name)
+
+                    actors.append(LevelActor(
+                        name=unique_name,
+                        mesh_name=mesh_name,
+                        location=loc,
+                        rotation=rot,
+                        scale=scl,
+                        parent=parent_name,
+                        component_props=child_props,
+                        world_location=world_loc,
+                        world_rotation=world_rot,
+                        world_scale=world_scl,
+                    ))
+
+                    _walk_composed_tree(child_idx, unique_name, depth + 1)
+                else:
+                    # No mesh — recurse with same parent name
+                    _walk_composed_tree(child_idx, parent_name, depth + 1)
+
+        _walk_composed_tree(root_comp_export_idx, actor_label)
 
     return LevelData(
         map_name=map_name,
