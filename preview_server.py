@@ -203,7 +203,7 @@ def start_server(umap_path, export_dir, content_dir, port=3050):
 
     # Count unique meshes
     mesh_names = set(a['mesh_name'] for a in scene_data['actors'])
-    with_glb = sum(1 for a in scene_data['actors'] if a['texture'])
+    with_glb = sum(1 for a in scene_data['actors'] if a['has_glb'])
     print(f"Scene: {len(scene_data['actors'])} actors, "
           f"{len(mesh_names)} unique meshes, {with_glb} with GLB")
 

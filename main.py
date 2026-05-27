@@ -5,6 +5,7 @@ Usage:
   python main.py [INPUT_DIR]           # Extract meshes + base color textures
   python main.py [INPUT_DIR] --preview LEVEL.umap  # Extract + show level preview in browser
   python main.py ./Input --skip-export --preview L_Showcase.umap  # Skip export, just preview
+  python main.py ./Input --skip-textures  # Embed textures in GLB but skip separate PNG export
 
 Arguments:
   INPUT_DIR    Path to folder containing .uproject and Content/ (default: ./Input)
@@ -13,6 +14,7 @@ Options:
   --preview LEVEL.umap  Parse a .umap level file and show 3D preview in browser (port 3050)
   --export-dir DIR      Output directory (default: ./Export)
   --skip-export         Skip export step, use existing Export/ directory
+  --skip-textures       Skip separate PNG export (textures still embedded in GLB)
 """
 import argparse
 import os
@@ -25,6 +27,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from uasset.package import Package
 from uasset.mesh import StaticMesh, export_glb
+import pickle
+import hashlib
 from uasset.texture import Texture2D, export_png, is_base_color_texture
 from uasset.properties import read_properties
 from uasset.scene import (
@@ -92,8 +96,13 @@ def classify_uasset(filepath, input_dir):
         return 'other', os.path.splitext(os.path.basename(filepath))[0]
 
 
-def process_assets(input_dir, export_dir):
-    """Find and export all meshes as GLB and base color textures as PNG."""
+def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None):
+    """Find and export all meshes as GLB and base color textures as PNG.
+
+    Args:
+        mesh_filter: If set, only export meshes whose name contains this
+            substring (case-insensitive).  Textures are still fully cached.
+    """
     os.makedirs(os.path.join(export_dir, "Meshes"), exist_ok=True)
     os.makedirs(os.path.join(export_dir, "Textures"), exist_ok=True)
 
@@ -121,22 +130,65 @@ def process_assets(input_dir, export_dir):
     # ------------------------------------------------------------------
     # Export base color textures as PNG  (also cache pixel data for GLB)
     # ------------------------------------------------------------------
+    # Use pickle cache to avoid re-parsing textures when Input/ is unchanged
+    cache_path = os.path.join(export_dir, "texture_cache.pkl")
+
+    # Compute a quick fingerprint of the Input/ texture files
+    def _input_fingerprint():
+        h = hashlib.md5()
+        for fp, n in sorted(textures):
+            if is_base_color_texture(n):
+                h.update(n.encode())
+                h.update(str(os.path.getmtime(fp)).encode())
+                h.update(str(os.path.getsize(fp)).encode())
+        return h.hexdigest()
+
     tex_success = 0
+    texture_cache = {}  # texture_name -> numpy RGBA pixels
+    tex_name_map = {}
+
     base_color_textures = [(fp, n) for fp, n in textures if is_base_color_texture(n)]
     print(f"Base color textures: {len(base_color_textures)} out of {len(textures)}")
 
-    texture_cache = {}  # texture_name -> numpy RGBA pixels
-    for filepath, name in tqdm(sorted(base_color_textures), desc="Exporting textures", unit="tex"):
+    # Try loading from pickle cache
+    fp_hash = _input_fingerprint()
+    cache_loaded = False
+    if os.path.exists(cache_path):
         try:
-            pkg = Package(filepath)
-            texture = Texture2D.from_package(pkg)
-            if texture and texture.pixels is not None:
-                png_path = os.path.join(export_dir, "Textures", f"{name}.png")
-                export_png(texture, png_path)
-                texture_cache[name] = texture.pixels
-                tex_success += 1
+            with open(cache_path, "rb") as f:
+                cached = pickle.load(f)
+            if isinstance(cached, dict) and cached.get("fingerprint") == fp_hash:
+                texture_cache = cached["textures"]
+                tex_success = len(texture_cache)
+                cache_loaded = True
+                print(f"  Loaded {tex_success} textures from pickle cache")
+        except Exception:
+            pass  # Corrupt cache — rebuild
+
+    if not cache_loaded:
+        for filepath, name in tqdm(sorted(base_color_textures), desc="Exporting textures", unit="tex"):
+            try:
+                pkg = Package(filepath)
+                texture = Texture2D.from_package(pkg)
+                if texture and texture.pixels is not None:
+                    if not skip_textures:
+                        png_path = os.path.join(export_dir, "Textures", f"{name}.png")
+                        export_png(texture, png_path)
+                    texture_cache[name] = texture.pixels
+                    tex_success += 1
+            except Exception as e:
+                tqdm.write(f"  {name}: ERROR {e}")
+
+        # Save pickle cache
+        try:
+            with open(cache_path, "wb") as f:
+                pickle.dump({"fingerprint": fp_hash, "textures": texture_cache}, f)
+            print(f"  Saved texture cache ({tex_success} textures) to {cache_path}")
         except Exception as e:
-            tqdm.write(f"  {name}: ERROR {e}")
+            print(f"  Warning: could not save texture cache: {e}")
+
+    if skip_textures:
+        print(f"  (PNG file export skipped --skip-textures, {tex_success} textures cached for GLB)")
 
     # Identity map so _get_base_color_texture_from_material returns the texture name
     tex_name_map = {name: name for name in texture_cache}
@@ -144,20 +196,64 @@ def process_assets(input_dir, export_dir):
     # ------------------------------------------------------------------
     # Export meshes as GLB with embedded textures
     # ------------------------------------------------------------------
+    if mesh_filter:
+        filtered = [(fp, n) for fp, n in meshes
+                    if mesh_filter.lower() in n.lower()]
+        print(f"Mesh filter '{mesh_filter}': {len(filtered)} of {len(meshes)} meshes match")
+        meshes_to_export = filtered
+    else:
+        meshes_to_export = meshes
+
     mesh_success = 0
-    for filepath, name in tqdm(sorted(meshes), desc="Exporting meshes", unit="mesh"):
+    for filepath, name in tqdm(sorted(meshes_to_export), desc="Exporting meshes", unit="mesh"):
         try:
             pkg = Package(filepath)
             mesh = StaticMesh.from_package(pkg)
             if mesh and mesh.vertices:
-                # Resolve textures for each material slot via the import chain
+                # Resolve textures for each material slot via the import chain.
+                # The key insight: polygon group N in the triangle data does NOT
+                # necessarily correspond to material import slot N.  The
+                # ImportedMaterialSlotName attribute maps each polygon group to a
+                # slot name, which must be matched against the ordered material
+                # import names to find the correct texture.
                 mesh_textures = []
                 material_names = _get_material_names_from_mesh(name, uasset_index)
-                for mat_idx, mat_name in enumerate(material_names):
-                    tex_name = _get_base_color_texture_from_material(
-                        mat_name, uasset_index, tex_name_map)
-                    if tex_name and tex_name in texture_cache:
-                        mesh_textures.append((mat_idx, texture_cache[tex_name]))
+
+                if mesh.material_slot_names:
+                    # Multi-(or single-)material mesh with slot name info:
+                    # match each polygon group's slot name to a material import.
+                    for pg_idx, slot_name in enumerate(mesh.material_slot_names):
+                        if slot_name is None:
+                            continue
+                        matched_mat_idx = None
+                        for mat_idx, mat_name in enumerate(material_names):
+                            # Strip common material-instance prefixes
+                            clean = mat_name
+                            for prefix in ('MI_', 'M_'):
+                                if clean.startswith(prefix):
+                                    clean = clean[len(prefix):]
+                                    break
+                            if (slot_name == clean
+                                    or slot_name in clean
+                                    or clean in slot_name):
+                                matched_mat_idx = mat_idx
+                                break
+                        if matched_mat_idx is None:
+                            matched_mat_idx = pg_idx  # fallback
+                        if matched_mat_idx < len(material_names):
+                            tex_name = _get_base_color_texture_from_material(
+                                material_names[matched_mat_idx],
+                                uasset_index, tex_name_map)
+                            if tex_name and tex_name in texture_cache:
+                                mesh_textures.append(
+                                    (pg_idx, texture_cache[tex_name]))
+                else:
+                    # No slot name info — assume polygon group == material index
+                    for mat_idx, mat_name in enumerate(material_names):
+                        tex_name = _get_base_color_texture_from_material(
+                            mat_name, uasset_index, tex_name_map)
+                        if tex_name and tex_name in texture_cache:
+                            mesh_textures.append((mat_idx, texture_cache[tex_name]))
 
                 glb_path = os.path.join(export_dir, "Meshes", f"{name}.glb")
                 export_glb(mesh, glb_path,
@@ -222,6 +318,14 @@ def main():
         help='Skip export step, use existing Export/ directory'
     )
     parser.add_argument(
+        '--skip-textures', action='store_true',
+        help='Skip texture export and embedding (meshes only, no PNGs)'
+    )
+    parser.add_argument(
+        '--filter', metavar='SUBSTRING', dest='mesh_filter',
+        help='Only export meshes whose name contains this substring (case-insensitive)'
+    )
+    parser.add_argument(
         '--gl', action='store_true',
         help='Use pyglet/OpenGL renderer instead of matplotlib CPU renderer'
     )
@@ -245,7 +349,8 @@ def main():
 
     # Export assets
     if not args.skip_export:
-        process_assets(input_dir, export_dir)
+        process_assets(input_dir, export_dir, skip_textures=args.skip_textures,
+                       mesh_filter=args.mesh_filter)
     else:
         print("Skipping export (using existing Export/ directory)")
 

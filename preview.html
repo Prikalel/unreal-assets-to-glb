@@ -258,21 +258,21 @@ let lastMouseX = 0, lastMouseY = 0;
 let camInputFocused = false;
 
 // ===========================================================================
-// Coordinate conversion: UE → Three.js
+// Coordinate conversion: UE → Three.js / glTF
 // ===========================================================================
-// UE: left-handed, Z-up, X-forward, Y-right
-// Three.js: right-handed, Y-up, Z-forward (looking down -Z)
-// Conversion matrix:
-//   three_x =  ue_x
+// UE: left-handed, X-forward, Y-right, Z-up
+// Three.js / glTF: right-handed, X-right, Y-up, -Z-forward
+// Conversion (must match GLB export in mesh.py):
+//   three_x =  ue_y
 //   three_y =  ue_z
-//   three_z = -ue_y
+//   three_z = -ue_x
 
 function ueToThreePos(ueLoc) {
-    return new THREE.Vector3(ueLoc.x, ueLoc.z, -ueLoc.y);
+    return new THREE.Vector3(-ueLoc.x, ueLoc.z, -ueLoc.y);
 }
 
 function threeToUEPos(threePos) {
-    return { x: threePos.x, y: -threePos.z, z: threePos.y };
+    return { x: -threePos.x, y: -threePos.z, z: threePos.y };
 }
 
 function ueToThreeMatrix(loc, rot, scale) {
@@ -295,9 +295,11 @@ function ueToThreeMatrix(loc, rot, scale) {
     );
 
     // Coordinate conversion: conv * M
+    // Maps UE (X-fwd, Y-right, Z-up) → Three.js (X-right, Y-up, -Z-fwd)
+    // glTF = (-UE_X, UE_Z, -UE_Y)
     const conv = new THREE.Matrix4();
     conv.set(
-        1,  0,  0, 0,
+       -1,  0,  0, 0,
         0,  0,  1, 0,
         0, -1,  0, 0,
         0,  0,  0, 1
@@ -311,10 +313,11 @@ function ueToThreeMatrix(loc, rot, scale) {
 // Decompose a Three.js object's world matrix back to UE coordinates
 function threeToUETransform(obj) {
     const wm = obj.matrixWorld;
-    // Inverse coordinate conversion
+    // Inverse coordinate conversion: Three.js → UE
+    // Inverse of (-UE_X, UE_Z, -UE_Y) is (-glTF_X, -glTF_Z, glTF_Y)
     const convInv = new THREE.Matrix4();
     convInv.set(
-        1,  0,  0, 0,
+       -1,  0,  0, 0,
         0,  0, -1, 0,
         0,  1,  0, 0,
         0,  0,  0, 1

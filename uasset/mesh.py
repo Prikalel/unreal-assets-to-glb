@@ -379,6 +379,37 @@ def _extract_attr_data(channel, attr_name, expected_type=None):
     return None
 
 
+def _extract_fname_attr(channel, attr_name):
+    """Extract FName (string list) attribute data from a channel.
+
+    Handles both bounded (TMeshAttributeArraySet) and unbounded
+    (TMeshUnboundedAttributeArraySet) FName attributes.
+    """
+    attrs = channel['attributes']
+    for name, attr in attrs['attributes'].items():
+        if name.strip() == attr_name or name == attr_name:
+            if attr['type'] != 6:  # FName
+                continue
+            if not attr['channels']:
+                continue
+            ch = attr['channels'][0]
+            if attr['bounded']:
+                data = ch.get('data')
+                if isinstance(data, list):
+                    return data
+            else:
+                # Unbounded: collect from chunks
+                chunks = ch.get('chunks', [])
+                result = []
+                for chunk in chunks:
+                    chunk_data = chunk.get('data')
+                    if isinstance(chunk_data, list):
+                        result.extend(chunk_data)
+                if result:
+                    return result
+    return None
+
+
 def _build_sparse_mapping(num_bits, words):
     """Build sparse-to-dense mapping from TBitArray validity mask.
 
@@ -475,14 +506,16 @@ def extract_mesh_data(elements: dict) -> Optional[dict]:
             normals.append((x, y, z))
         result['normals'] = _maybe_expand_sparse(normals, vi_ch, default=(0.0, 0.0, 1.0))
 
-    # --- UV coordinates (per vertex instance, all TextureCoordinate channels) ---
+    # --- UV coordinates (per vertex instance, channel 0 = texture UV) ---
     uv_channels = []
     vi_attrs = vi_ch['attributes']
+
     for name, attr in vi_attrs['attributes'].items():
         if (name.strip() == 'TextureCoordinate' or name == 'TextureCoordinate') and attr['type'] == 2:
-            for ch_idx, channel in enumerate(attr['channels']):
-                if ch_idx == 1:
-                    continue  # Skip lightmap UV channel
+            # Use only channel 0 (primary texture UV).
+            # Channel 1 is lightmap UV and is skipped.
+            if attr['channels']:
+                channel = attr['channels'][0]
                 if isinstance(channel.get('data'), bytes):
                     ch_raw = channel['data']
                     ch_count = channel['count']
@@ -516,27 +549,53 @@ def extract_mesh_data(elements: dict) -> Optional[dict]:
         v0, v1, v2 = struct.unpack_from('<iii', raw_tri, i * 12)
         triangles_raw.append((v0, v1, v2))
 
-    # MaterialIndex (per triangle, int32) — optional
+    # Material assignment — UE5 uses PolygonGroupIndex (one per triangle)
+    # which maps directly to the material slot index.  Fall back to the
+    # older MaterialIndex attribute if it exists.
     material_indices: List[int] = []
+    mat_attr_name = None
     for name, attr in tri_attrs['attributes'].items():
         n = name.strip()
-        if n == 'MaterialIndex' and attr['type'] == 4:
-            ch_list = attr.get('channels', [])
-            if ch_list:
-                ch = ch_list[0]
-                if isinstance(ch.get('data'), bytes):
-                    raw_mi = ch['data']
-                    count_mi = ch['count']
-                    for i in range(count_mi):
-                        mi = struct.unpack_from('<i', raw_mi, i * 4)[0]
-                        material_indices.append(mi)
+        if n == 'PolygonGroupIndex' and attr['type'] == 4:
+            mat_attr_name = n
             break
+        if n == 'MaterialIndex' and attr['type'] == 4:
+            mat_attr_name = n
+            # keep looking — prefer PolygonGroupIndex if it exists
+    if mat_attr_name:
+        for name, attr in tri_attrs['attributes'].items():
+            n = name.strip()
+            if n == mat_attr_name and attr['type'] == 4:
+                ch_list = attr.get('channels', [])
+                if ch_list:
+                    ch = ch_list[0]
+                    if isinstance(ch.get('data'), bytes):
+                        raw_mi = ch['data']
+                        count_mi = ch['count']
+                        for i in range(count_mi):
+                            mi = struct.unpack_from('<i', raw_mi, i * 4)[0]
+                            material_indices.append(mi)
+                break
 
     # Build triangles with material indices: (vi0, vi1, vi2, material_index)
     result['triangles'] = [
         (t[0], t[1], t[2], material_indices[i] if i < len(material_indices) else 0)
         for i, t in enumerate(triangles_raw)
     ]
+
+    # --- Material slot names from PolygonGroups ---
+    # ImportedMaterialSlotName maps each polygon group to a material slot
+    # name.  This is needed because polygon group N does NOT necessarily
+    # correspond to material import slot N — the slot names must be matched
+    # against the ordered material import names to build the correct mapping.
+    material_slot_names = None
+    if 'PolygonGroups' in elements:
+        pg_ch = elements['PolygonGroups']['channels'][0]
+        slot_names = _extract_fname_attr(pg_ch, 'ImportedMaterialSlotName')
+        if slot_names:
+            slot_names = _maybe_expand_sparse(slot_names, pg_ch, default=None)
+            material_slot_names = slot_names
+    result['material_slot_names'] = material_slot_names
 
     return result
 
@@ -552,6 +611,7 @@ class StaticMesh:
         self.uvs: List[List[Tuple[float, float]]] = []  # list of UV channels
         self.triangles: List[Tuple[int, int, int, int]] = []  # (vi0, vi1, vi2, material_index)
         self.vi_to_vertex: List[int] = []
+        self.material_slot_names: Optional[List[Optional[str]]] = None
 
     @classmethod
     def from_package(cls, pkg: Package) -> Optional['StaticMesh']:
@@ -588,6 +648,7 @@ class StaticMesh:
         mesh.normals = mesh_data['normals']
         mesh.uvs = mesh_data['uvs']
         mesh.triangles = mesh_data['triangles']
+        mesh.material_slot_names = mesh_data.get('material_slot_names')
 
         return mesh
 
@@ -757,6 +818,11 @@ def export_glb(mesh: StaticMesh, filepath: str,
     # ------------------------------------------------------------------
     # Geometry — one primitive per material group
     # ------------------------------------------------------------------
+    # UE left-handed (X fwd, Y right, Z up) → glTF right-handed
+    # (X right, Y up, -Z fwd).  The mapping  glTF = (-UE_X, UE_Z, -UE_Y)
+    # has determinant -1 so it flips handedness (and therefore face
+    # winding CW→CCW) without needing a negative node scale.
+    # ------------------------------------------------------------------
     for mat_idx in sorted_mat_indices:
         tris = material_groups[mat_idx]
 
@@ -766,24 +832,24 @@ def export_glb(mesh: StaticMesh, filepath: str,
         indices: list = []
 
         for vi0, vi1, vi2 in tris:
-            # Reverse winding: UE CW front → glTF CCW front
-            vi0, vi2 = vi2, vi0
             for vi in (vi0, vi1, vi2):
                 if vi not in vi_to_local:
                     # Position — resolve through vi_to_vertex
                     v_idx = mesh.vi_to_vertex[vi] if vi < len(mesh.vi_to_vertex) else vi
                     pos = mesh.vertices[v_idx] if v_idx < len(mesh.vertices) else (0.0, 0.0, 0.0)
-                    # UE → glTF:  x=x, y=z, z=-y
-                    px, py, pz = pos[0], pos[2], -pos[1]
+                    # UE → glTF:  x=-ue_x, y=ue_z, z=-ue_y
+                    px, py, pz = -pos[0], pos[2], -pos[1]
 
-                    # Normal (same coordinate conversion)
+                    # Normal — same coordinate conversion
                     if has_normals and vi < len(mesh.normals):
                         n = mesh.normals[vi]
-                        nx, ny, nz = n[0], n[2], -n[1]
+                        nx, ny, nz = -n[0], n[2], -n[1]
                     else:
                         nx, ny, nz = 0.0, 1.0, 0.0
 
-                    # UV — glTF uses same V convention as UE (V=0 at top), no flip needed
+                    # UV — no V-flip needed: UE5 stores textures top-to-bottom
+                    # (same as PNG/glTF), and the UV coordinate (0,0) already
+                    # maps to the first pixel row in both engines.
                     if has_uvs and vi < len(uvs):
                         u, v = uvs[vi]
                     else:
@@ -851,7 +917,10 @@ def export_glb(mesh: StaticMesh, filepath: str,
     gltf = GLTF2()
     gltf.scene = 0
     gltf.scenes = [GLTFScene(nodes=[0])]
-    gltf.nodes = [GLTFNode(mesh=0)]
+    # No negative scale needed — the axis remap (UE_Y, UE_Z, -UE_X)
+    # already flips handedness and is baked into the geometry.
+    node = GLTFNode(mesh=0)
+    gltf.nodes = [node]
     gltf.meshes = [GLTFMesh(primitives=gltf_primitives)]
     gltf.materials = gltf_materials
     if gltf_textures:
