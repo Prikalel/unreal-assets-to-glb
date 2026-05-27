@@ -430,5 +430,170 @@ def _get_base_color_texture_from_material(material_name: str,
                 f"texture '{tex_asset_name}'")
             return mapped
 
+    # Master Material fallback: when TextureParameterValues is empty
+    # (typical for master Materials, not MaterialInstanceConstants),
+    # parse the MaterialEditorOnlyData export to find the BaseColor
+    # expression, then trace it to a MaterialExpressionTextureSample
+    # and resolve its Texture2D import reference.
+    tex_name = _get_base_color_from_master_material(pkg)
+    if tex_name is not None:
+        mapped = tex_map.get(tex_name)
+        if mapped is None:
+            for en, ep in tex_map.items():
+                if en.lower() == tex_name.lower():
+                    mapped = ep
+                    break
+        if mapped is not None:
+            logger.debug(
+                f"  '{material_name}': master-material BaseColor "
+                f"expression -> texture '{tex_name}'")
+            return mapped
+
+    return None
+
+
+def _get_base_color_from_master_material(pkg: Package) -> Optional[str]:
+    """Parse MaterialEditorOnlyData to find the BaseColor texture.
+
+    Walks the chain:
+      MaterialEditorOnlyData -> BaseColor (FColorMaterialInput)
+        -> Expression (FPackageIndex -> MaterialExpressionTextureSample export)
+          -> Texture (FPackageIndex -> Texture2D import)
+
+    Returns the Texture2D import object name, or None.
+    """
+    from .properties import (
+        TAG_HasArrayIndex, TAG_HasPropertyGuid, TAG_HasPropertyExtensions,
+    )
+    from .package import UE5_PROPERTY_TAG_EXTENSION
+
+    # Find the MaterialEditorOnlyData export
+    eod_idx = None
+    for i in range(pkg.export_count):
+        if pkg.get_export_class_name(i) == 'MaterialEditorOnlyData':
+            eod_idx = i
+            break
+    if eod_idx is None:
+        return None
+
+    reader = pkg.get_export_data(eod_idx)
+    if reader is None:
+        return None
+
+    use_ext = pkg.file_version_ue5 >= UE5_PROPERTY_TAG_EXTENSION
+
+    # Skip SerializationControl byte
+    reader.seek(1)
+
+    # Read tagged properties until we find BaseColor
+    while reader.can_read(8):
+        name_idx = reader.read_int32()
+        _name_num = reader.read_int32()
+        name = pkg.name_map[name_idx] if 0 <= name_idx < len(pkg.name_map) else f"#{name_idx}"
+
+        if name == 'None':
+            break
+
+        # Read type tree
+        total_nodes = 1
+        type_names: List[str] = []
+        i = 0
+        while i < total_nodes:
+            t_idx = reader.read_int32()
+            _t_num = reader.read_int32()
+            inner_count = reader.read_int32()
+            t_name = pkg.name_map[t_idx] if 0 <= t_idx < len(pkg.name_map) else f"#{t_idx}"
+            type_names.append(t_name)
+            total_nodes += inner_count
+            i += 1
+
+        size = reader.read_int32()
+        flags = reader.read_uint8()
+
+        if flags & TAG_HasArrayIndex:
+            reader.skip(4)
+
+        value_start = reader.position()
+
+        if name == 'BaseColor' and len(type_names) >= 2 and type_names[0] == 'StructProperty':
+            # Parse FColorMaterialInput (FMaterialInput base + UseConstant + Constant)
+            # FMaterialInput:
+            #   Expression: FPackageIndex (int32)
+            #   OutputIndex: int32
+            #   InputName: FName (8 bytes)
+            #   Mask, MaskR, MaskG, MaskB, MaskA: 5 x int32
+            # FColorMaterialInput:
+            #   UseConstant: uint32
+            #   Constant: FColor (4 bytes)
+            if size < 40:
+                reader.skip(size)
+            else:
+                expression_fpi = reader.read_int32()
+                # Skip remaining fields: OutputIndex(4) + InputName(8) +
+                # Mask(4)*5 + UseConstant(4) + Constant(4) = 40 bytes total
+                # We already read 4 (expression_fpi), skip the rest
+                reader.skip(size - 4)
+
+                # Resolve Expression FPackageIndex to an export
+                if expression_fpi > 0:
+                    exp_idx = expression_fpi - 1
+                    if 0 <= exp_idx < len(pkg.exports):
+                        cn = pkg.get_export_class_name(exp_idx)
+                        if cn == 'MaterialExpressionTextureSample':
+                            tex_name = _get_texture_from_expression(pkg, exp_idx)
+                            if tex_name is not None:
+                                return tex_name
+        else:
+            reader.skip(size)
+
+        if flags & TAG_HasPropertyGuid:
+            reader.skip(16)
+        if use_ext and (flags & TAG_HasPropertyExtensions):
+            ext = reader.read_uint8()
+            if ext & 0x01:
+                reader.skip(1 + 4)
+
+        # Ensure alignment
+        remaining = size - (reader.position() - value_start)
+        if remaining > 0:
+            reader.skip(remaining)
+
+    return None
+
+
+def _get_texture_from_expression(pkg: Package, exp_idx: int) -> Optional[str]:
+    """Parse a MaterialExpressionTextureSample export to find its Texture reference.
+
+    The export data layout (after SerializationControl byte) is native-serialized.
+    The Texture FPackageIndex is located by scanning for references to Texture2D imports.
+
+    Returns the Texture2D import object name, or None.
+    """
+    import struct as _struct
+
+    reader = pkg.get_export_data(exp_idx)
+    if reader is None:
+        return None
+
+    data = reader.data
+
+    # Build set of Texture2D import FPackageIndex values
+    tex_imports = {}
+    for imp_i, imp in enumerate(pkg.imports):
+        if imp.class_name == 'Texture2D':
+            fpi = -(imp_i + 1)
+            tex_imports[fpi] = imp.object_name
+
+    if not tex_imports:
+        return None
+
+    # Scan for FPackageIndex values that reference Texture2D imports.
+    # The Texture property in MaterialExpressionTextureSample is typically
+    # the first Texture2D reference after the UObject header.
+    for offset in range(0, len(data) - 3):
+        val = _struct.unpack_from('<i', data, offset)[0]
+        if val in tex_imports:
+            return tex_imports[val]
+
     return None
 
