@@ -38,6 +38,20 @@ The output is `./Export` folder created in current workspace.
 
 - level parts (level isntansing) included in preview
 - material parent recursive search
-- slot indexes recognition
-- multiple UV channels
+- material slot indexes recognition
+- only 1 UV channel
 - texture override in material instance
+
+## Not included
+
+- lights,
+- colliders,
+- PBR textures,
+- vertex colors,
+- tangents,
+- LOD
+- shaders,
+- texture baking,
+- Nanite,
+- animation decompression
+- skeletons/bones
