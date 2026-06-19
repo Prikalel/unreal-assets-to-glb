@@ -262,7 +262,23 @@ class Texture2D:
 
     @classmethod
     def from_package(cls, pkg: Package) -> Optional['Texture2D']:
-        """Parse texture from an uncooked Package."""
+        """Parse texture from an uncooked Package.
+
+        PRIMARY PATH (uncooked UE4.27 assets): the source art lives inside a
+        chunked-ZLIB or raw-PNG ``FByteBulkData`` blob in the package trailer.
+        This is implemented in :mod:`uasset.uncooked_texture` and is tried
+        first.  The legacy trailer / FCompressedBuffer path below is kept as a
+        fallback for assets that use a different storage layout.
+        """
+        from .uncooked_texture import parse_uncooked_texture
+        try:
+            tex = parse_uncooked_texture(pkg)
+            if tex is not None and tex.pixels is not None:
+                return tex
+        except Exception:
+            pass
+
+        # FALLBACK: legacy trailer / compressed-buffer path -------------------
         tex_indices = pkg.find_exports_by_class("Texture2D")
         if not tex_indices:
             return None
