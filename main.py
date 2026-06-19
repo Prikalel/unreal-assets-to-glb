@@ -195,7 +195,24 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None)
     else:
         meshes_to_export = meshes
 
+    def _resolve_tex(mat_name, mesh_name):
+        """Resolve a base-color texture for one material slot.
+
+        Wrapped per-material (Fix A) so a parse error in one material yields
+        "no texture for this slot" rather than aborting the whole GLB save.
+        """
+        if not mat_name:
+            return None
+        try:
+            return _get_base_color_texture_from_material(
+                mat_name, uasset_index, tex_name_map)
+        except Exception as e:
+            tqdm.write(f"  {mesh_name}: material '{mat_name}' "
+                       f"texture resolve skipped: {e}")
+            return None
+
     mesh_success = 0
+    tex_bound_meshes = 0  # meshes that got at least one embedded texture
     for filepath, name in tqdm(sorted(meshes_to_export), desc="Exporting meshes", unit="mesh"):
         try:
             pkg = Package(filepath)
@@ -227,8 +244,7 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None)
                             mat_name = None
                         if mat_name is None:
                             continue
-                        tex_name = _get_base_color_texture_from_material(
-                            mat_name, uasset_index, tex_name_map)
+                        tex_name = _resolve_tex(mat_name, name)
                         if tex_name and tex_name in texture_cache:
                             mesh_textures.append(
                                 (pg_idx, texture_cache[tex_name]))
@@ -238,8 +254,7 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None)
                     material_names = _get_material_names_from_mesh(
                         name, uasset_index)
                     for mat_idx, mat_name in enumerate(material_names):
-                        tex_name = _get_base_color_texture_from_material(
-                            mat_name, uasset_index, tex_name_map)
+                        tex_name = _resolve_tex(mat_name, name)
                         if tex_name and tex_name in texture_cache:
                             mesh_textures.append(
                                 (mat_idx, texture_cache[tex_name]))
@@ -247,11 +262,16 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None)
                 glb_path = os.path.join(export_dir, "Meshes", f"{name}.glb")
                 export_glb(mesh, glb_path,
                            textures=mesh_textures if mesh_textures else None)
+                if mesh_textures:
+                    tex_bound_meshes += 1
                 mesh_success += 1
         except Exception as e:
             tqdm.write(f"  {name}: ERROR {e}")
 
+    bind_rate = (100.0 * tex_bound_meshes / mesh_success) if mesh_success else 0.0
     print(f"Export complete: {mesh_success} meshes, {tex_success} textures")
+    print(f"Texture binding: {tex_bound_meshes}/{mesh_success} meshes "
+          f"with embedded texture ({bind_rate:.1f}%)")
     return mesh_success, tex_success
 
 

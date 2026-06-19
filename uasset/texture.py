@@ -366,7 +366,12 @@ class Texture2D:
             from io import BytesIO
             try:
                 img = Image.open(BytesIO(raw_data))
-                tex.pixels = np.array(img.convert('RGBA'))
+                _px = np.array(img.convert('RGBA'))
+                # UE quirk (Texture.cpp:1063): TSF_BGRA8 PNG source art stores
+                # the BGRA8 memory as RGBA, so R and B are swapped in the PNG.
+                if source_data.get('FormatStr', '').upper() == 'TSF_BGRA8':
+                    _px = _px[..., [2, 1, 0, 3]]
+                tex.pixels = np.ascontiguousarray(_px)
                 tex.width = img.width
                 tex.height = img.height
                 tex.format = 1  # BGRA8 equivalent

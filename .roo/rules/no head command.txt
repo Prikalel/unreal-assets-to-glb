@@ -1,1 +1,3 @@
 there is no ` | head -N` in windows operating system (you are on windows)
+
+Multi-line python -c isn't outputting on cmd.exe

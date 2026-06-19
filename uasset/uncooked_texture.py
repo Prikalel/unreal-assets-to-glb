@@ -470,6 +470,17 @@ def parse_uncooked_texture(pkg) -> Optional[Any]:
             decoded_as_png = True
         except Exception:
             pixels = None
+        # UE quirk (Texture.cpp:1063): "TSF_BGRA8 is stored as RGBA, so the R
+        # and B channels are swapped in the internal png."  UE writes the BGRA8
+        # source memory into the PNG as if it were RGBA, so the PNG (and thus
+        # the PIL-decoded array) has R and B swapped relative to the true
+        # colour.  Swap them back for BGRA8 textures.  RGBA8 / grayscale PNGs
+        # are unaffected.
+        if pixels is not None and (fmt_name or "").upper() == "TSF_BGRA8" \
+                and pixels.ndim == 3 and pixels.shape[-1] >= 3:
+            order = list(range(pixels.shape[-1]))
+            order[0], order[2] = order[2], order[0]
+            pixels = np.ascontiguousarray(pixels[..., order])
 
     if pixels is None and not decoded_as_png:
         # Raw source art (bPNGCompressed == False) or a PNG that failed to load.
