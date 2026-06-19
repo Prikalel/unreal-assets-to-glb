@@ -1,4 +1,4 @@
-"""Texture parser and PNG exporter for UE 5.5 uncooked .uasset files.
+"""Texture parser and PNG exporter for UE4.27 uncooked .uasset files.
 
 Handles uncooked editor assets where texture source art is stored in
 FEditorBulkData (Source.BulkData) in the package trailer, compressed
@@ -247,7 +247,7 @@ def _extract_source_struct(r: BinaryReader, name_map: List[str],
 # ---------------------------------------------------------------------------
 
 class Texture2D:
-    """Parsed uncooked Texture2D from a UE 5.5 .uasset package."""
+    """Parsed uncooked Texture2D from a UE4.27 .uasset package."""
 
     __slots__ = ('width', 'height', 'format', 'format_str',
                  'compression_format', 'pixels')

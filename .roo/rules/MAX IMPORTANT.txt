@@ -1,0 +1,1 @@
+MAX IMPORTANT: look at the source code serialization in UE code folder rather than guessing

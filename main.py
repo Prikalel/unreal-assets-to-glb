@@ -1,5 +1,5 @@
 """
-UE 5.5 UAsset Parser, Exporter, and Level Previewer
+UE 4.27 UAsset Parser, Exporter, and Level Previewer
 
 Usage:
   python main.py [INPUT_DIR]           # Extract meshes + base color textures
@@ -47,8 +47,8 @@ def find_uproject(input_dir):
                 data = json.load(fh)
             engine = data.get('EngineAssociation', '')
             print(f"Found project: {f} (Engine: {engine})")
-            if not engine.startswith('5.'):
-                print(f"WARNING: Engine version {engine} may not be compatible (expected 5.x)")
+            if not engine.startswith('4.27') and not engine.startswith('4.'):
+                print(f"WARNING: Engine version {engine} may not be compatible (expected 4.27)")
             return path
     print("WARNING: No .uproject file found in input directory")
     return None
@@ -288,7 +288,7 @@ def preview_level(input_dir, export_dir, umap_filename):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="UE 5.5 UAsset Parser, Exporter, and Level Previewer"
+        description="UE 4.27 UAsset Parser, Exporter, and Level Previewer"
     )
     parser.add_argument(
         'input_dir', nargs='?', default='./Input',
@@ -324,7 +324,7 @@ def main():
         sys.exit(1)
 
     print("=" * 60)
-    print("UE 5.5 UAsset Parser, Exporter, and Level Previewer")
+    print("UE 4.27 UAsset Parser, Exporter, and Level Previewer")
     print("=" * 60)
     print(f"Input:  {input_dir}")
     print(f"Output: {export_dir}")

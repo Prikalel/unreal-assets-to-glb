@@ -1,17 +1,30 @@
-"""Static mesh parser and OBJ/GLB exporter for UE 5.5 .uasset files.
+"""Static mesh parser and OBJ/GLB exporter for UE 4.27 .uasset files.
 
-Parses FMeshDescription from FCompressedBuffer payload in the package trailer.
-Pipeline: .uasset → Package → Trailer → FCompressedBuffer → Oodle decompress → FMeshDescription → OBJ/GLB
+Supports both cooked (FStaticMeshRenderData) and uncooked (FMeshDescription) formats.
+Pipeline: .uasset → Package → Export Bulk Data → Render Data → OBJ/GLB
+
+Cooked UE4.27 Format (FStaticMeshRenderData):
+- VertexBuffers: PositionVertexBuffer (positions), StaticMeshVertexBuffer (UVs, tangents)
+- IndexBuffer: Triangle indices
+- Sections: Material slot information per section
+
+Uncooked Format (FMeshDescription):
+- Triangles have structural data: VertexInstanceIDs[3] + PolygonID
+- Material index comes from PolygonGroupID
 """
 import os
+import sys
 import struct
-from typing import Dict, List, Tuple, Optional
+import zlib
+from typing import Dict, List, Tuple, Optional, Any
 
 import numpy as np
 import ooz
 
 from .reader import BinaryReader
 from .package import Package
+from .bulk_data import find_mesh_description_bulk_data, BULKDATA_SerializeCompressedZLIB, BulkDataEntry, extract_bulk_data, find_bulk_data_in_export
+from .uncooked_mesh import parse_uncooked_static_mesh
 
 try:
     from pygltflib import (
@@ -47,8 +60,20 @@ def _be_uint64(data, offset):
     return struct.unpack_from('>Q', data, offset)[0]
 
 
+def decompress_zlib(data: bytes) -> Optional[bytes]:
+    """Decompress ZLIB-compressed data.
+    
+    Returns the decompressed bytes, or None on failure.
+    """
+    try:
+        return zlib.decompress(data)
+    except Exception as e:
+        #print(f"[DEBUG] ZLIB decompression failed: {e}")
+        return None
+
+
 def decompress_compressed_buffer(data: bytes) -> Optional[bytes]:
-    """Decompress an FCompressedBuffer (UE5 big-endian header + Oodle/LZ4 blocks).
+    """Decompress an FCompressedBuffer (UE4.27 big-endian header + Oodle/LZ4 blocks).
 
     Returns the raw decompressed bytes, or None on failure.
     """
@@ -204,12 +229,17 @@ class _MeshDescReader:
 
     def read_fstring(self):
         length = self.read_int32()
+        # Safety check for corrupt string lengths
+        if abs(length) > 1000000:  # 1MB string limit
+            raise ValueError(f"String length too large: {length}")
         if length > 0:
             s = self.data[self.pos:self.pos + length - 1].decode('latin-1', errors='replace')
             self.pos += length
             return s
         elif length < 0:
             char_count = -length
+            if char_count > 500000:  # 500k chars for UTF-16
+                raise ValueError(f"UTF-16 string char count too large: {char_count}")
             s = self.data[self.pos:self.pos + char_count * 2].decode('utf-16-le', errors='replace')
             self.pos += char_count * 2
             return s
@@ -217,7 +247,13 @@ class _MeshDescReader:
 
     def read_tbit_array(self):
         num_bits = self.read_int32()
+        # Safety check for corrupt num_bits
+        if num_bits < 0 or num_bits > 10000000:  # 10M elements max
+            raise ValueError(f"num_bits out of range: {num_bits}")
         num_words = (num_bits + 31) // 32
+        # Safety check for too many words
+        if num_words > 1000000:  # 4MB of words max
+            raise ValueError(f"num_words too large: {num_words}")
         words = []
         for _ in range(num_words):
             words.append(self.read_uint32())
@@ -262,11 +298,15 @@ class _MeshDescReader:
             # BulkSerialize: ElementSize(i32) + Count(i32) + raw data
             serialized_elem_size = self.read_int32()
             count = self.read_int32()
+            if count < 0 or count > 10000000:
+                raise ValueError(f"count out of range in parse_attribute_array_base: {count}")
             raw = self.read_bytes(count * serialized_elem_size)
             return {'extent': extent, 'count': count, 'data': raw}
         else:
             # Element-by-element: TArray serialization (Count + elements)
             count = self.read_int32()
+            if count < 0 or count > 100000:
+                raise ValueError(f"count out of range in element-by-element parsing: {count}")
             if attr_type == 6:  # FName -> FString
                 strings = [self.read_fstring() for _ in range(count)]
                 return {'extent': extent, 'count': count, 'data': strings}
@@ -281,15 +321,23 @@ class _MeshDescReader:
         if attr_type in _ATTR_TYPE_SIZES:
             serialized_elem_size = self.read_int32()
             data_count = self.read_int32()
+            if data_count < 0 or data_count > 10000000:
+                raise ValueError(f"data_count out of range: {data_count}")
             raw = self.read_bytes(data_count * serialized_elem_size)
         elif attr_type == 6:
             data_count = self.read_int32()
+            if data_count < 0 or data_count > 100000:
+                raise ValueError(f"data_count out of range for FName: {data_count}")
             raw = [self.read_fstring() for _ in range(data_count)]
         else:
             data_count = self.read_int32()
+            if data_count < 0 or data_count > 10000000:
+                raise ValueError(f"data_count out of range: {data_count}")
             raw = self.read_bytes(data_count * 4)
 
         chunk_num_elements = self.read_int32()
+        if chunk_num_elements < 0 or chunk_num_elements > 10000000:
+            raise ValueError(f"chunk_num_elements out of range: {chunk_num_elements}")
         start_indices = [self.read_int32() for _ in range(chunk_num_elements)]
         counts = [self.read_int32() for _ in range(chunk_num_elements)]
         max_counts = [self.read_int32() for _ in range(chunk_num_elements)]
@@ -313,6 +361,12 @@ class _MeshDescReader:
 
         num_elements = self.read_int32()
         num_channels = self.read_int32()
+        
+        # Safety checks
+        if num_elements < 0 or num_elements > 10000000:
+            raise ValueError(f"num_elements out of range: {num_elements}")
+        if num_channels < 0 or num_channels > 1000:
+            raise ValueError(f"num_channels out of range: {num_channels}")
 
         if extent > 0:
             # Bounded: TMeshAttributeArraySet
@@ -340,26 +394,97 @@ class _MeshDescReader:
             attributes[key] = entry
         return {'num_elements': num_elements, 'attributes': attributes}
 
-    def parse_element_container(self):
-        """Parse FMeshElementContainer."""
+    def parse_element_container(self, element_type=None):
+        """Parse FMeshElementContainer for UE4.27.
+        
+        UE4.27 format:
+        - TBitArray (allocated indices)
+        - Element data (for valid elements only)
+        - Attributes
+        
+        Args:
+            element_type: Hint about element type for parsing structural data
+                          ('Triangles', 'Polygons', etc.)
+        """
         num_bits, words = self.read_tbit_array()
         num_holes = self.read_int32()
         valid_count = self.count_valid_elements(num_bits, words)
+        
+        # Read element data for each valid element (UE4.27)
+        element_data = []
+        
+        if element_type == 'Triangles':
+            # FMeshTriangle in UE4.27:
+            # - VertexInstanceID[0] (int32)
+            # - VertexInstanceID[1] (int32)
+            # - VertexInstanceID[2] (int32)
+            # - PolygonID (int32) - always present in UE4.27 MeshDescriptionTriangles
+            for _ in range(valid_count):
+                vi0 = self.read_int32()
+                vi1 = self.read_int32()
+                vi2 = self.read_int32()
+                polygon_id = self.read_int32()
+                element_data.append({
+                    'vi0': vi0, 'vi1': vi1, 'vi2': vi2, 'polygon_id': polygon_id
+                })
+        elif element_type == 'Polygons':
+            # FMeshPolygon in UE4.27:
+            # - VertexInstanceIDs (TArray<int32>)
+            # - TriangleIDs (TArray<int32>)
+            # - PolygonGroupID (int32)
+            for _ in range(valid_count):
+                num_vis = self.read_int32()
+                vis = [self.read_int32() for __ in range(num_vis)]
+                num_tris = self.read_int32()
+                tris = [self.read_int32() for __ in range(num_tris)]
+                poly_group_id = self.read_int32()
+                element_data.append({
+                    'vis': vis, 'tris': tris, 'poly_group_id': poly_group_id
+                })
+        elif element_type == 'Vertices':
+            # FMeshVertex: no data (just empty struct after new serialization)
+            pass
+        elif element_type == 'VertexInstances':
+            # FMeshVertexInstance:
+            # - VertexID (int32)
+            for _ in range(valid_count):
+                vertex_id = self.read_int32()
+                element_data.append({'vertex_id': vertex_id})
+        elif element_type == 'Edges':
+            # FMeshEdge:
+            # - VertexID[0] (int32)
+            # - VertexID[1] (int32)
+            for _ in range(valid_count):
+                vid0 = self.read_int32()
+                vid1 = self.read_int32()
+                element_data.append({'vid0': vid0, 'vid1': vid1})
+        else:
+            # Unknown element type - try to skip data
+            # We can't skip properly without knowing the structure
+            # Assume no element data for safety
+            pass
+        
         attributes = self.parse_attributes_set_base()
+        
         return {'num_bits': num_bits, 'num_holes': num_holes,
                 'valid_count': valid_count, 'words': words,
-                'attributes': attributes}
+                'element_data': element_data, 'attributes': attributes}
 
     def parse_mesh_description(self):
         """Parse the full FMeshDescription."""
         num_entries = self.read_int32()
+        #print(f"[DEBUG] Parsing mesh description with {num_entries} entries")
         elements = {}
         for i in range(num_entries):
             key = self.read_fstring()
+            #print(f"[DEBUG] Entry {i}/{num_entries}: {key}")
             # FMeshElementChannels: TArray<FMeshElementContainer>
             num_channels = self.read_int32()
-            channels = [self.parse_element_container() for _ in range(num_channels)]
+            #print(f"[DEBUG]   Parsing {num_channels} channels...")
+            # Pass element type hint for UE4.27 structural data parsing
+            channels = [self.parse_element_container(element_type=key) for _ in range(num_channels)]
             elements[key] = {'channels': channels}
+        #print(f"[DEBUG] Finished parsing mesh description")
         return elements
 
 
@@ -484,16 +609,18 @@ def extract_mesh_data(elements: dict) -> Optional[dict]:
     if 'VertexInstances' not in elements:
         return None
     vi_ch = elements['VertexInstances']['channels'][0]
-    vi_data = _extract_attr_data(vi_ch, 'VertexIndex', expected_type=4)
-    if vi_data is None:
-        return None
-    raw = vi_data['data']
-    count = vi_data['count']
-    vi_to_vertex = []
-    for i in range(count):
-        idx = struct.unpack_from('<i', raw, i * 4)[0]
-        vi_to_vertex.append(idx)
-    result['vi_to_vertex'] = _maybe_expand_sparse(vi_to_vertex, vi_ch, default=0)
+    vi_element_data = vi_ch.get('element_data', [])
+    
+    # UE4.27: Read vertex ID from element data
+    vi_to_vertex_dense = []
+    for elem in vi_element_data:
+        if 'vertex_id' in elem:
+            vi_to_vertex_dense.append(elem['vertex_id'])
+    
+    if not vi_to_vertex_dense:
+        return result
+    
+    result['vi_to_vertex'] = _maybe_expand_sparse(vi_to_vertex_dense, vi_ch, default=0)
 
     # --- Normals (per vertex instance) ---
     normal_data = _extract_attr_data(vi_ch, 'Normal', expected_type=1)
@@ -542,51 +669,57 @@ def extract_mesh_data(elements: dict) -> Optional[dict]:
     if 'Triangles' not in elements:
         return None
     tri_ch = elements['Triangles']['channels'][0]
-    tri_attrs = tri_ch['attributes']
+    tri_element_data = tri_ch.get('element_data', [])
 
-    # VertexInstanceIndex (extent=3, int32)
-    raw_tri = None
-    tri_count = 0
-    for name, attr in tri_attrs['attributes'].items():
-        if name == 'VertexInstanceIndex' and attr['type'] == 4 and attr['extent'] == 3:
-            raw_tri = attr['channels'][0]['data']
-            tri_count = attr['channels'][0]['count']
-            break
-    if raw_tri is None:
-        return result
-
+    # UE4.27: Read triangle vertex instances from element data
     triangles_raw = []
-    for i in range(tri_count // 3):
-        v0, v1, v2 = struct.unpack_from('<iii', raw_tri, i * 12)
-        triangles_raw.append((v0, v1, v2))
+    
+    if not tri_element_data:
+        return result
+    
+    # Parse triangles from element data
+    # Each triangle has: vi0, vi1, vi2, polygon_id
+    tri_to_polygon = []  # Map triangle index to polygon ID
+    tri_idx = 0
+    for elem in tri_element_data:
+        if 'vi0' in elem and 'vi1' in elem and 'vi2' in elem and 'polygon_id' in elem:
+            triangles_raw.append((elem['vi0'], elem['vi1'], elem['vi2']))
+            tri_to_polygon.append(elem['polygon_id'])
+            tri_idx += 1
 
-    # Material assignment — UE5 uses PolygonGroupIndex (one per triangle)
-    # which maps directly to the material slot index.  Fall back to the
-    # older MaterialIndex attribute if it exists.
+    # --- Material indices from Triangle → Polygon → PolygonGroup ---
     material_indices: List[int] = []
-    mat_attr_name = None
-    for name, attr in tri_attrs['attributes'].items():
-        n = name.strip()
-        if n == 'PolygonGroupIndex' and attr['type'] == 4:
-            mat_attr_name = n
-            break
-        if n == 'MaterialIndex' and attr['type'] == 4:
-            mat_attr_name = n
-            # keep looking — prefer PolygonGroupIndex if it exists
-    if mat_attr_name:
-        for name, attr in tri_attrs['attributes'].items():
-            n = name.strip()
-            if n == mat_attr_name and attr['type'] == 4:
-                ch_list = attr.get('channels', [])
-                if ch_list:
-                    ch = ch_list[0]
-                    if isinstance(ch.get('data'), bytes):
-                        raw_mi = ch['data']
-                        count_mi = ch['count']
-                        for i in range(count_mi):
-                            mi = struct.unpack_from('<i', raw_mi, i * 4)[0]
-                            material_indices.append(mi)
-                break
+    
+    if 'Polygons' in elements:
+        poly_ch = elements['Polygons']['channels'][0]
+        poly_element_data = poly_ch.get('element_data', [])
+        
+        # Build mapping from polygon ID (sparse index) to polygon group ID
+        # We need to account for sparse indices (holes)
+        poly_sparse_to_dense = _build_sparse_mapping(
+            poly_ch['num_bits'], poly_ch['words']
+        )
+        
+        # Build dense array of polygon group IDs indexed by dense polygon ID
+        poly_group_dense = []
+        for elem in poly_element_data:
+            if 'poly_group_id' in elem:
+                poly_group_dense.append(elem['poly_group_id'])
+        
+        # Map triangle polygon IDs to polygon group IDs
+        for poly_id in tri_to_polygon:
+            # poly_id is the sparse polygon ID
+            if poly_id in poly_sparse_to_dense:
+                dense_poly_idx = poly_sparse_to_dense[poly_id]
+                if dense_poly_idx < len(poly_group_dense):
+                    material_indices.append(poly_group_dense[dense_poly_idx])
+                else:
+                    material_indices.append(0)
+            else:
+                material_indices.append(0)
+    else:
+        # No polygons data, default to material 0
+        material_indices = [0] * len(triangles_raw)
 
     # Build triangles with material indices: (vi0, vi1, vi2, material_index)
     result['triangles'] = [
@@ -833,6 +966,7 @@ class StaticMesh:
         self.uvs: List[List[Tuple[float, float]]] = []  # list of UV channels
         self.triangles: List[Tuple[int, int, int, int]] = []  # (vi0, vi1, vi2, material_index)
         self.vi_to_vertex: List[int] = []
+        self.indices: Optional[List[int]] = None  # Raw index buffer (for cooked meshes)
         self.material_slot_names: Optional[List[Optional[str]]] = None
         # Ordered list of (ImportedMaterialSlotName, material_import_name)
         # tuples parsed from the StaticMaterials export property, indexed by
@@ -843,28 +977,101 @@ class StaticMesh:
 
     @classmethod
     def from_package(cls, pkg: Package) -> Optional['StaticMesh']:
-        """Parse static mesh from a Package using the FMeshDescription pipeline."""
+        """Parse static mesh from a Package.
+        
+        Tries cooked FStaticMeshRenderData format first, then falls back to
+        uncooked FMeshDescription format.
+        """
+        import sys
         mesh = cls()
 
-        # Read raw file data
-        file_data = pkg.reader.data
-
-        # Extract FCompressedBuffer from package trailer
-        compressed_buffer = extract_trailer_payload(file_data)
-        if compressed_buffer is None:
+        # Find StaticMesh export
+        sm_export_idx = None
+        for i in range(pkg.export_count):
+            if pkg.get_export_class_name(i) == 'StaticMesh':
+                sm_export_idx = i
+                break
+        
+        if sm_export_idx is None:
+            print("[DEBUG] No StaticMesh export found")
             return None
+        
+        print(f"[DEBUG] StaticMesh export index: {sm_export_idx}")
 
-        # Decompress
+        # ------------------------------------------------------------------
+        # PRIMARY PATH (uncooked UE4.27 assets): the geometry lives inside a
+        # compressed FMeshDescription bulk-data blob referenced from the
+        # StaticMesh export serial data.  This is the correct, fully-decoded
+        # path implemented in uasset/uncooked_mesh.py.  Try it first because
+        # these are uncooked (bCooked == 0) assets.
+        # ------------------------------------------------------------------
+        print("[DEBUG] Trying uncooked export-serial FMeshDescription path...")
+        sys.stdout.flush()
+        try:
+            geo = parse_uncooked_static_mesh(pkg)
+            if geo is not None and geo.get('vertices'):
+                mesh.vertices = geo['vertices']
+                mesh.vi_to_vertex = geo['vi_to_vertex']
+                mesh.normals = geo['normals']
+                mesh.uvs = geo['uvs']
+                mesh.triangles = geo['triangles']
+                mesh.material_slot_names = geo.get('material_slot_names')
+                _apply_material_mapping(mesh, pkg)
+                print(f"[DEBUG] Uncooked path OK: {len(mesh.vertices)} verts, "
+                      f"{len(mesh.triangles)} tris")
+                return mesh
+            print("[DEBUG] Uncooked path returned no geometry; trying fallbacks")
+        except Exception as e:
+            print(f"[DEBUG] Uncooked path failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+        # FALLBACK 1: cooked FStaticMeshRenderData format
+        print("[DEBUG] Trying cooked FStaticMeshRenderData format...")
+        sys.stdout.flush()
+        try:
+            mesh = parse_cooked_static_mesh(pkg)
+            if mesh is not None:
+                print("[DEBUG] Successfully parsed cooked mesh")
+                return mesh
+        except Exception as e:
+            print(f"[DEBUG] Cooked mesh parsing failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+        # Fall back to uncooked FMeshDescription format
+        print("[DEBUG] Falling back to FMeshDescription format...")
+        sys.stdout.flush()
+
+        # Extract mesh description from file trailer (uncooked packages)
+        print("[DEBUG] Extracting trailer payload...")
+        compressed_buffer = extract_trailer_payload(pkg.reader.data)
+        if compressed_buffer is None:
+            print("[DEBUG] Failed to extract trailer payload")
+            return None
+        
+        print(f"[DEBUG] Compressed buffer size: {len(compressed_buffer)} bytes")
+
+        # Decompress FCompressedBuffer (Oodle/LZ4)
         raw_data = decompress_compressed_buffer(compressed_buffer)
         if raw_data is None:
+            print("[DEBUG] Failed to decompress FCompressedBuffer")
             return None
+        
+        print(f"[DEBUG] Decompressed FCompressedBuffer: {len(raw_data)} bytes")
 
         # Parse FMeshDescription
+        print("[DEBUG] Parsing mesh description...")
+        sys.stdout.flush()
         reader = _MeshDescReader(raw_data)
         try:
             elements = reader.parse_mesh_description()
-        except Exception:
+        except Exception as e:
+            print(f"[DEBUG] Exception during mesh description parsing: {e}")
+            import traceback
+            traceback.print_exc()
             return None
+        print(f"[DEBUG] Mesh description parsed, elements: {list(elements.keys())}")
 
         # Extract mesh data
         mesh_data = extract_mesh_data(elements)
@@ -878,43 +1085,51 @@ class StaticMesh:
         mesh.triangles = mesh_data['triangles']
         mesh.material_slot_names = mesh_data.get('material_slot_names')
 
-        # Parse real material slot mapping from export data
-        mesh.material_slots = _parse_static_materials(pkg)
-
-        # Apply SectionInfoMap overrides — the map can remap which
-        # StaticMaterials entry each polygon group (section) uses.
-        if mesh.material_slots and mesh.material_slot_names:
-            sm_export_idx = None
-            for i in range(pkg.export_count):
-                if pkg.get_export_class_name(i) == 'StaticMesh':
-                    sm_export_idx = i
-                    break
-            if sm_export_idx is not None:
-                exp_reader = pkg.get_export_data(sm_export_idx)
-                if exp_reader is not None:
-                    section_map = _parse_section_info_map(
-                        exp_reader.data, pkg.name_map,
-                        len(mesh.material_slot_names))
-                    mesh.section_info_map = section_map
-                    if section_map is not None:
-                        # section_map[pg_idx] = material slot index into
-                        # StaticMaterials; mesh.material_slots[slot_idx] =
-                        # (slot_name, material_name).  Remap material_slot_names
-                        # so each PG gets the ImportedMaterialSlotName from the
-                        # correct StaticMaterials entry.
-                        remapped: List[Optional[str]] = []
-                        for pg_idx in range(len(mesh.material_slot_names)):
-                            if pg_idx < len(section_map):
-                                mat_idx = section_map[pg_idx]
-                                if mat_idx < len(mesh.material_slots):
-                                    remapped.append(
-                                        mesh.material_slots[mat_idx][0])
-                                    continue
-                            remapped.append(
-                                mesh.material_slot_names[pg_idx])
-                        mesh.material_slot_names = remapped
+        _apply_material_mapping(mesh, pkg)
 
         return mesh
+
+
+def _apply_material_mapping(mesh: 'StaticMesh', pkg: Package) -> None:
+    """Populate the material slot mapping on *mesh* from the export data.
+
+    Reads the ordered ``StaticMaterials`` array (ImportedMaterialSlotName +
+    material import name) and the ``SectionInfoMap`` (polygon-group index ->
+    material slot index) and applies the latter as an override so that each
+    polygon group resolves to the correct ``ImportedMaterialSlotName``.
+    """
+    mesh.material_slots = _parse_static_materials(pkg)
+
+    if mesh.material_slots and mesh.material_slot_names:
+        sm_export_idx = None
+        for i in range(pkg.export_count):
+            if pkg.get_export_class_name(i) == 'StaticMesh':
+                sm_export_idx = i
+                break
+        if sm_export_idx is not None:
+            exp_reader = pkg.get_export_data(sm_export_idx)
+            if exp_reader is not None:
+                section_map = _parse_section_info_map(
+                    exp_reader.data, pkg.name_map,
+                    len(mesh.material_slot_names))
+                mesh.section_info_map = section_map
+                if section_map is not None:
+                    # section_map[pg_idx] = material slot index into
+                    # StaticMaterials; mesh.material_slots[slot_idx] =
+                    # (slot_name, material_name).  Remap material_slot_names
+                    # so each PG gets the ImportedMaterialSlotName from the
+                    # correct StaticMaterials entry.
+                    remapped: List[Optional[str]] = []
+                    for pg_idx in range(len(mesh.material_slot_names)):
+                        if pg_idx < len(section_map):
+                            mat_idx = section_map[pg_idx]
+                            if mat_idx < len(mesh.material_slots):
+                                remapped.append(
+                                    mesh.material_slots[mat_idx][0])
+                                continue
+                        remapped.append(
+                            mesh.material_slot_names[pg_idx])
+                    mesh.material_slot_names = remapped
 
 
 # ---------------------------------------------------------------------------
@@ -1198,4 +1413,144 @@ def export_glb(mesh: StaticMesh, filepath: str,
     gltf.buffers = [Buffer(byteLength=len(binary))]
 
     gltf.set_binary_blob(bytes(binary))
+    gltf.save(filepath)
+    return filepath
+
+
+# ---------------------------------------------------------------------------
+# FStaticMeshRenderData parsing (Cooked UE4.27)
+# ---------------------------------------------------------------------------
+
+def parse_cooked_static_mesh(pkg: Package) -> Optional[StaticMesh]:
+    """Parse a cooked StaticMesh using FStaticMeshRenderData format.
+    
+    Args:
+        pkg: Package object containing the StaticMesh
+        
+    Returns:
+        StaticMesh object or None if parsing fails
+    """
+    from .mesh_render_data import (
+        find_render_data_bulk_data,
+        decompress_bulk_data,
+        parse_position_vertex_buffer,
+        parse_static_mesh_vertex_buffer,
+        parse_index_buffer,
+        parse_static_mesh_sections
+    )
+    
+    # Find StaticMesh export
+    sm_export_idx = None
+    for i in range(pkg.export_count):
+        if pkg.get_export_class_name(i) == 'StaticMesh':
+            sm_export_idx = i
+            break
+    
+    if sm_export_idx is None:
+        return None
+    
+    # Find bulk data entries
+    bulk_data_list = find_render_data_bulk_data(pkg, sm_export_idx)
+    if bulk_data_list is None:
+        return None
+    
+    mesh = StaticMesh()
+    
+    # Try to identify and parse each bulk data entry
+    for entry, raw_data in bulk_data_list:
+        # Decompress if needed
+        decompressed = decompress_bulk_data(raw_data, entry.flags)
+        if decompressed is None:
+            continue
+        
+        data_len = len(decompressed)
+        
+        # Try to parse as different buffer types based on size and structure
+        
+        # PositionVertexBuffer: starts with num_vertices (uint32), ~12 bytes per vertex
+        if data_len >= 4 and data_len <= 100000000 and not mesh.vertices:
+            try:
+                num_vertices = struct.unpack_from('<I', decompressed, 0)[0]
+                if 0 < num_vertices <= 10000000 and data_len == 4 + num_vertices * 12:
+                    positions = parse_position_vertex_buffer(decompressed)
+                    if positions and len(positions) == num_vertices:
+                        mesh.vertices = positions
+                        continue
+            except:
+                pass
+        
+        # IndexBuffer: starts with stride (uint32) + num_indices (uint32)
+        if data_len >= 8 and not mesh.indices:
+            try:
+                stride = struct.unpack_from('<I', decompressed, 0)[0]
+                if stride in (2, 4):
+                    indices = parse_index_buffer(decompressed)
+                    if indices and len(indices) > 0:
+                        mesh.indices = indices
+                        continue
+            except:
+                pass
+        
+        # StaticMeshVertexBuffer: has stride, num_tex_coords, num_vertices
+        if data_len >= 12 and mesh.vertices and not mesh.uvs:
+            try:
+                stride = struct.unpack_from('<I', decompressed, 0)[0]
+                num_vertices = len(mesh.vertices)
+                if stride >= 32 and stride <= 64:
+                    uv_data = parse_static_mesh_vertex_buffer(decompressed, num_vertices)
+                    if uv_data:
+                        mesh.uvs = uv_data['uvs']
+                        continue
+            except:
+                pass
+        
+        # Sections array
+        if data_len >= 8 and not hasattr(mesh, 'sections'):
+            sections = parse_static_mesh_sections(decompressed)
+            if sections:
+                mesh.sections = sections
+                continue
+    
+    # Validate we have essential data
+    if not mesh.vertices or not mesh.indices:
+        return None
+    
+    # Build triangles from indices
+    if len(mesh.indices) % 3 != 0:
+        return None
+    
+    mesh.triangles = []
+    num_tris = len(mesh.indices) // 3
+    
+    for i in range(num_tris):
+        i0 = mesh.indices[i * 3 + 0]
+        i1 = mesh.indices[i * 3 + 1]
+        i2 = mesh.indices[i * 3 + 2]
+        
+        # Determine material index from sections
+        mat_idx = 0
+        if hasattr(mesh, 'sections') and mesh.sections:
+            for section in mesh.sections:
+                first_tri = section['first_index'] // 3
+                tri_count = section['num_triangles']
+                if first_tri <= i < first_tri + tri_count:
+                    mat_idx = section['material_index']
+                    break
+        
+        mesh.triangles.append((i0, i1, i2, mat_idx))
+    
+    # Parse material slots from export
+    mesh.material_slots = _parse_static_materials(pkg)
+    
+    # Build material slot names
+    if mesh.material_slots:
+        mesh.material_slot_names = [slot[0] if slot else f"Material_{i}"
+                                    for i, slot in enumerate(mesh.material_slots)]
+    else:
+        mesh.material_slot_names = ["Material_0"]
+    
+    # Build vi_to_vertex (identity mapping for cooked meshes)
+    mesh.vi_to_vertex = list(range(len(mesh.vertices)))
+    
+    return mesh
     gltf.save(filepath)

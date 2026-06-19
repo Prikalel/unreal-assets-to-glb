@@ -1,7 +1,10 @@
-"""Package header parser for UE5 .uasset files.
+"""Package header parser for UE4 .uasset files.
 
-Based on reverse-engineered format from UAssetAPI source code and actual UE5.5 files.
-Key difference from UE4: FileVersionUE5 comes BEFORE FileVersionLicenseeUE4.
+Based on reverse-engineered format from UAssetAPI source code and actual UE4.27 files.
+Key features:
+- LegacyFileVersion -7 for UE4.26/4.27
+- No FileVersionUE5 field (UE5 only)
+- FileVersionUE4 517 for UE4.27
 """
 import struct
 from typing import List, Optional, Tuple
@@ -11,6 +14,10 @@ from .reader import BinaryReader
 # UE4 ObjectVersion enum values (from UAssetAPI ObjectVersion.cs)
 VER_UE4_OLDEST_LOADABLE_PACKAGE = 214
 VER_UE4_WORLD_LEVEL_INFO = 223
+
+# UE5 property tag feature flags (not used in UE4.27, values provided for compatibility)
+UE5_PROPERTY_TAG_COMPLETE_TYPE_NAME = 1008
+UE5_PROPERTY_TAG_EXTENSION = 1011
 VER_UE4_CHANGED_CHUNKID_TO_BE_AN_ARRAY_OF_CHUNKIDS = 324
 VER_UE4_ENGINE_VERSION_OBJECT = 334
 VER_UE4_LOAD_FOR_EDITOR_GAME = 363
@@ -25,25 +32,7 @@ VER_UE4_64BIT_EXPORTMAP_SERIALSIZES = 509
 VER_UE4_ADDED_PACKAGE_SUMMARY_LOCALIZATION_ID = 514
 VER_UE4_ADDED_PACKAGE_OWNER = 516
 VER_UE4_NON_OUTER_PACKAGE_IMPORT = 518
-
-# UE5 ObjectVersionUE5 enum values (from UAssetAPI ObjectVersion.cs)
-UE5_INITIAL_VERSION = 1000
-UE5_NAMES_REFERENCED_FROM_EXPORT_DATA = 1001
-UE5_PAYLOAD_TOC = 1002
-UE5_OPTIONAL_RESOURCES = 1003
-UE5_LARGE_WORLD_COORDINATES = 1004
-UE5_REMOVE_OBJECT_EXPORT_PACKAGE_GUID = 1005
-UE5_TRACK_OBJECT_EXPORT_IS_INHERITED = 1006
-UE5_FSOFTOBJECTPATH_REMOVE_ASSET_PATH_FNAMES = 1007
-UE5_ADD_SOFTOBJECTPATH_LIST = 1008
-UE5_DATA_RESOURCES = 1009
-UE5_SCRIPT_SERIALIZATION_OFFSET = 1010
-UE5_PROPERTY_TAG_EXTENSION = 1011
-UE5_PROPERTY_TAG_COMPLETE_TYPE_NAME = 1012
-UE5_METADATA_SERIALIZATION_OFFSET = 1014
-UE5_VERSE_CELLS = 1015
-UE5_PACKAGE_SAVED_HASH = 1016
-UE5_IMPORT_TYPE_HIERARCHIES = 1018
+VER_UE4_517 = 517  # UE4.27 ObjectVersion
 
 # Bulk data flags (from UE source, EBulkDataFlags)
 BULKDATA_PayloadAtEndOfFile = 1 << 0       # 0x01
@@ -113,7 +102,7 @@ class ExportEntry:
 
 
 class Package:
-    """Parses a UE5 .uasset package file."""
+    """Parses a UE4 .uasset package file."""
 
     def __init__(self, filepath: str):
         self.filepath = filepath
@@ -124,7 +113,7 @@ class Package:
         self.legacy_file_version = 0
         self.legacy_ue3_version = 0
         self.file_version_ue4 = 0
-        self.file_version_ue5 = 0
+        self.file_version_ue5 = 0  # UE5 only, 0 for UE4.27
         self.file_version_licensee_ue4 = 0
         self.custom_versions: List[Tuple[bytes, int]] = []
         self.total_header_size = 0
@@ -155,10 +144,10 @@ class Package:
         if self.tag != 0x9E2A83C1:
             raise ValueError(f"Invalid tag: 0x{self.tag:08X}")
 
-        # 2. LegacyFileVersion
+        # 2. LegacyFileVersion (UE4.27 uses -7)
         self.legacy_file_version = r.read_int32()
-        if self.legacy_file_version != -8:
-            raise ValueError(f"Unexpected LegacyFileVersion: {self.legacy_file_version}")
+        if self.legacy_file_version != -7:
+            raise ValueError(f"Unexpected LegacyFileVersion: {self.legacy_file_version} (expected -7 for UE4.27)")
 
         # 3. LegacyUE3Version
         self.legacy_ue3_version = r.read_int32()
@@ -166,19 +155,10 @@ class Package:
         # 4. FileVersionUE4
         self.file_version_ue4 = r.read_int32()
 
-        # 5. FileVersionUE5 (BEFORE FileVersionLicenseeUE4!)
-        if self.legacy_file_version <= -8:
-            self.file_version_ue5 = r.read_int32()
-
-        # 6. FileVersionLicenseeUE4
+        # 5. FileVersionLicenseeUE4
         self.file_version_licensee_ue4 = r.read_int32()
 
-        # 7. SavedHash + SectionSixOffset (UE5 >= PACKAGE_SAVED_HASH)
-        if self.file_version_ue5 >= UE5_PACKAGE_SAVED_HASH:
-            r.skip(20)  # SavedHash (FIoHash, 20 bytes)
-            self.total_header_size = r.read_int32()  # SectionSixOffset
-
-        # 8. Custom version container (Optimized format)
+        # 6. Custom version container (Optimized format)
         if self.legacy_file_version <= -2:
             cv_count = r.read_int32()
             for _ in range(cv_count):
@@ -186,150 +166,135 @@ class Package:
                 version = r.read_int32()
                 self.custom_versions.append((guid, version))
 
-        # 9. TotalHeaderSize / SectionSixOffset (UE5 < PACKAGE_SAVED_HASH)
-        if self.file_version_ue5 < UE5_PACKAGE_SAVED_HASH:
-            self.total_header_size = r.read_int32()
+        # 7. TotalHeaderSize
+        self.total_header_size = r.read_int32()
+        #print(f"  TotalHeaderSize: {self.total_header_size}, position: {r.position()}")
 
-        # 10. FolderName
+        # 8. FolderName
         self.folder_name = r.read_fstring()
+        #print(f"  FolderName: '{self.folder_name}', position: {r.position()}")
 
-        # 11. PackageFlags
+        # 9. PackageFlags
         self.package_flags = r.read_uint32()
+        #print(f"  PackageFlags: 0x{self.package_flags:08X}, position: {r.position()}")
 
-        # 12-13. NameCount, NameOffset
+        # 10-11. NameCount, NameOffset
         self.name_count = r.read_int32()
         self.name_offset = r.read_int32()
+        #print(f"  NameCount: {self.name_count}, NameOffset: {self.name_offset}, position: {r.position()}")
 
-        # 14. SoftObjectPaths (UE5 >= ADD_SOFTOBJECTPATH_LIST)
-        if self.file_version_ue5 >= UE5_ADD_SOFTOBJECTPATH_LIST:
-            _sop_count = r.read_int32()
-            _sop_offset = r.read_int32()
-
-        # 15. LocalizationId (ObjectVersion >= VER_UE4_ADDED_PACKAGE_SUMMARY_LOCALIZATION_ID)
+        # 12. LocalizationId (ObjectVersion >= VER_UE4_ADDED_PACKAGE_SUMMARY_LOCALIZATION_ID)
         if self.file_version_ue4 >= VER_UE4_ADDED_PACKAGE_SUMMARY_LOCALIZATION_ID:
             _loc_id = r.read_fstring()
 
-        # 16. GatherableTextData (ObjectVersion >= VER_UE4_SERIALIZE_TEXT_IN_PACKAGES)
+        # 13. GatherableTextData (ObjectVersion >= VER_UE4_SERIALIZE_TEXT_IN_PACKAGES)
         if self.file_version_ue4 >= VER_UE4_SERIALIZE_TEXT_IN_PACKAGES:
             _gather_count = r.read_int32()
             _gather_offset = r.read_int32()
 
-        # 17-18. ExportCount, ExportOffset
+        # 14-15. ExportCount, ExportOffset
         self.export_count = r.read_int32()
         self.export_offset = r.read_int32()
+        #print(f"  ExportCount: {self.export_count}, ExportOffset: {self.export_offset}, position: {r.position()}")
 
-        # 19-20. ImportCount, ImportOffset
+        # 16-17. ImportCount, ImportOffset
         self.import_count = r.read_int32()
         self.import_offset = r.read_int32()
+        #print(f"  ImportCount: {self.import_count}, ImportOffset: {self.import_offset}, position: {r.position()}")
 
-        # 21. CellExport/Import (UE5 >= VERSE_CELLS)
-        if self.file_version_ue5 >= UE5_VERSE_CELLS:
-            r.skip(16)  # 4 int32s: CellExportCount, CellExportOffset, CellImportCount, CellImportOffset
-
-        # 22. MetaDataOffset (UE5 >= METADATA_SERIALIZATION_OFFSET)
-        if self.file_version_ue5 >= UE5_METADATA_SERIALIZATION_OFFSET:
-            _meta_offset = r.read_int32()
-
-        # 23. DependsOffset
+        # 18. DependsOffset
         self.depends_offset = r.read_int32()
+        #print(f"  DependsOffset: {self.depends_offset}, position: {r.position()}")
 
-        # 24-25. SoftPackageReferences
+        # 19-20. SoftPackageReferences
         if self.file_version_ue4 >= VER_UE4_ADD_STRING_ASSET_REFERENCES_MAP:
             _soft_count = r.read_int32()
             _soft_offset = r.read_int32()
 
-        # 26. SearchableNamesOffset
+        # 21. SearchableNamesOffset
         if self.file_version_ue4 >= VER_UE4_ADDED_SEARCHABLE_NAMES:
             _search_offset = r.read_int32()
 
-        # 27. ThumbnailTableOffset
+        # 22. ThumbnailTableOffset
         _thumb_offset = r.read_int32()
 
-        # 28. ImportTypeHierarchies (UE5 >= IMPORT_TYPE_HIERARCHIES)
-        if self.file_version_ue5 >= UE5_IMPORT_TYPE_HIERARCHIES:
-            _ith_count = r.read_int32()
-            _ith_offset = r.read_int32()
+        # 23. PackageGuid
+        _pkg_guid = r.read_bytes(16)
 
-        # 29. PackageGuid (UE5 < PACKAGE_SAVED_HASH)
-        if self.file_version_ue5 < UE5_PACKAGE_SAVED_HASH:
-            _pkg_guid = r.read_bytes(16)
+        # 24. PersistentGuid (ObjectVersion >= VER_UE4_ADDED_PACKAGE_OWNER) - SKIPPED for cooked packages
+        # 25. OwnerPersistentGuid (VER_UE4_ADDED_PACKAGE_OWNER <= ObjectVersion < VER_UE4_NON_OUTER_PACKAGE_IMPORT) - SKIPPED for cooked packages
+        # Note: These editor-only fields may not be present in some packages
 
-        # 30. PersistentGuid (ObjectVersion >= VER_UE4_ADDED_PACKAGE_OWNER)
-        if self.file_version_ue4 >= VER_UE4_ADDED_PACKAGE_OWNER:
-            _persistent_guid = r.read_bytes(16)
-
-        # 31. Extra bytes (VER_UE4_ADDED_PACKAGE_OWNER <= ObjectVersion < VER_UE4_NON_OUTER_PACKAGE_IMPORT)
-        if (self.file_version_ue4 >= VER_UE4_ADDED_PACKAGE_OWNER and
-                self.file_version_ue4 < VER_UE4_NON_OUTER_PACKAGE_IMPORT):
-            r.skip(16)
-
-        # 32-33. Generations
+        # 26-27. Generations
         gen_count = r.read_int32()
-        for _ in range(gen_count):
+        #print(f"  Generations count: {gen_count}")
+        # Safety check for corrupt gen_count
+        if gen_count < 0 or gen_count > 1000:
+            raise ValueError(f"gen_count out of range: {gen_count}")
+        for i in range(gen_count):
             r.skip(8)  # ExportCount + NameCount per generation
 
-        # 34. SavedByEngineVersion (ObjectVersion >= VER_UE4_ENGINE_VERSION_OBJECT)
+        # 28. SavedByEngineVersion (ObjectVersion >= VER_UE4_ENGINE_VERSION_OBJECT)
         if self.file_version_ue4 >= VER_UE4_ENGINE_VERSION_OBJECT:
             self._read_engine_version(r)
 
-        # 35. CompatibleWithEngineVersion
+        # 29. CompatibleWithEngineVersion
         if self.file_version_ue4 >= VER_UE4_PACKAGE_SUMMARY_HAS_COMPATIBLE_ENGINE_VERSION:
             self._read_engine_version(r)
 
-        # 36. CompressionFlags
+        # 30. CompressionFlags
         _comp_flags = r.read_uint32()
 
-        # 37. CompressedChunksCount
+        # 31. CompressedChunksCount
         chunk_count = r.read_int32()
         if chunk_count > 0:
             r.skip(chunk_count * 16)
 
-        # 38. PackageSource
+        # 32. PackageSource
         _pkg_source = r.read_uint32()
 
-        # 39. AdditionalPackagesToCook
+        # 33. AdditionalPackagesToCook
         add_count = r.read_int32()
         for _ in range(add_count):
             r.read_fstring()
 
-        # 40. TextureAllocations (LegacyFileVersion > -7) — not for our files (-8)
+        # 34. TextureAllocations (only for LegacyFileVersion > -7)
+        if self.legacy_file_version > -7:
+            _texture_alloc_count = r.read_int32()
+            if _texture_alloc_count > 0:
+                r.skip(_texture_alloc_count * 12)
 
-        # 41. AssetRegistryDataOffset
+        # 35. AssetRegistryDataOffset
         _asset_reg = r.read_int32()
 
-        # 42. BulkDataStartOffset
+        # 36. BulkDataStartOffset
         self.bulk_data_start_offset = r.read_int64()
 
-        # 43. WorldTileInfoDataOffset (ObjectVersion >= VER_UE4_WORLD_LEVEL_INFO)
+        # 37. WorldTileInfoDataOffset (ObjectVersion >= VER_UE4_WORLD_LEVEL_INFO)
         if self.file_version_ue4 >= VER_UE4_WORLD_LEVEL_INFO:
             _world_tile = r.read_int32()
 
-        # 44. ChunkIDs (ObjectVersion >= VER_UE4_CHANGED_CHUNKID_TO_BE_AN_ARRAY_OF_CHUNKIDS)
+        # 38. ChunkIDs (ObjectVersion >= VER_UE4_CHANGED_CHUNKID_TO_BE_AN_ARRAY_OF_CHUNKIDS)
         if self.file_version_ue4 >= VER_UE4_CHANGED_CHUNKID_TO_BE_AN_ARRAY_OF_CHUNKIDS:
             chunk_id_count = r.read_int32()
             r.skip(chunk_id_count * 4)
 
-        # 45-46. PreloadDependency
+        # 39-40. PreloadDependency
         if self.file_version_ue4 >= VER_UE4_PRELOAD_DEPENDENCIES_IN_COOKED_EXPORTS:
             _preload_count = r.read_int32()
             _preload_offset = r.read_int32()
 
-        # 47. NamesReferencedFromExportDataCount (UE5 >= NAMES_REFERENCED_FROM_EXPORT_DATA)
-        if self.file_version_ue5 >= UE5_NAMES_REFERENCED_FROM_EXPORT_DATA:
-            _names_ref_count = r.read_int32()
-
-        # 48. PayloadTocOffset (UE5 >= PAYLOAD_TOC)
-        if self.file_version_ue5 >= UE5_PAYLOAD_TOC:
-            _payload_toc_offset = r.read_int64()
-
-        # 49. DataResourceOffset (UE5 >= DATA_RESOURCES)
-        if self.file_version_ue5 >= UE5_DATA_RESOURCES:
-            _data_resource_offset = r.read_int32()
-
-        # Now read maps
+        #print("  Reading name map...")
         self._read_name_map()
+        #print(f"  Name map read: {len(self.name_map)} names")
+        
+        #print("  Reading import map...")
         self._read_import_map()
+        #print(f"  Import map read: {len(self.imports)} imports")
+        
+        #print("  Reading export map...")
         self._read_export_map()
+        #print(f"  Export map read: {len(self.exports)} exports")
 
     @staticmethod
     def _read_engine_version(r: BinaryReader):
@@ -349,7 +314,6 @@ class Package:
     def _read_import_map(self):
         r = self.reader
         r.seek(self.import_offset)
-        has_optional = self.file_version_ue5 >= UE5_OPTIONAL_RESOURCES
         has_package_name = self.file_version_ue4 >= VER_UE4_NON_OUTER_PACKAGE_IMPORT
 
         self.imports = []
@@ -370,9 +334,6 @@ class Package:
             if has_package_name:
                 r.skip(8)  # PackageName (FName: index + number)
 
-            if has_optional:
-                entry.b_import_optional = r.read_int32() != 0
-
             self.imports.append(entry)
 
     def _read_export_map(self):
@@ -381,10 +342,6 @@ class Package:
 
         has_template = self.file_version_ue4 >= VER_UE4_TemplateIndex_IN_COOKED_EXPORTS
         has_64bit_serial = self.file_version_ue4 >= VER_UE4_64BIT_EXPORTMAP_SERIALSIZES
-        no_pkg_guid = self.file_version_ue5 >= UE5_REMOVE_OBJECT_EXPORT_PACKAGE_GUID
-        has_inherited = self.file_version_ue5 >= UE5_TRACK_OBJECT_EXPORT_IS_INHERITED
-        has_optional = self.file_version_ue5 >= UE5_OPTIONAL_RESOURCES
-        has_script_offset = self.file_version_ue5 >= UE5_SCRIPT_SERIALIZATION_OFFSET
         has_preload = self.file_version_ue4 >= VER_UE4_PRELOAD_DEPENDENCIES_IN_COOKED_EXPORTS
         has_editor_game = self.file_version_ue4 >= VER_UE4_LOAD_FOR_EDITOR_GAME
         has_is_asset = self.file_version_ue4 >= VER_UE4_COOKED_ASSETS_IN_EDITOR_SUPPORT
@@ -416,11 +373,8 @@ class Package:
             entry.b_not_for_client = r.read_int32()
             entry.b_not_for_server = r.read_int32()
 
-            if not no_pkg_guid:
-                r.skip(16)  # PackageGuid
-
-            if has_inherited:
-                entry.is_inherited_instance = r.read_int32()
+            # PackageGuid (always present in UE4)
+            r.skip(16)
 
             entry.package_flags = r.read_uint32()
 
@@ -430,19 +384,12 @@ class Package:
             if has_is_asset:
                 entry.b_is_asset = r.read_int32()
 
-            if has_optional:
-                entry.generate_public_hash = r.read_int32()
-
             if has_preload:
                 entry.first_export_dependency = r.read_int32()
                 entry.serialization_before_serialization_dependencies = r.read_int32()
                 entry.create_before_serialization_dependencies = r.read_int32()
                 entry.serialization_after_serialization_dependencies = r.read_int32()
                 entry.create_before_create_dependencies = r.read_int32()
-
-            if has_script_offset:
-                entry.script_serialization_start_offset = r.read_int64()
-                entry.script_serialization_end_offset = r.read_int64()
 
             self.exports.append(entry)
 

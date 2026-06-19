@@ -79,6 +79,9 @@ class BinaryReader:
     def read_fstring(self) -> str:
         length = self.read_int32()
         if length > 0:
+            # Safety check: don't read more than 10MB
+            if length > 10 * 1024 * 1024:
+                raise ValueError(f"FString length too large: {length}")
             data = self.read_bytes(length)
             # Strip null terminator
             try:
@@ -87,6 +90,9 @@ class BinaryReader:
                 return data.rstrip(b'\x00').decode('latin-1')
         elif length < 0:
             char_count = -length
+            # Safety check: don't read more than 10MB
+            if char_count > 5 * 1024 * 1024:
+                raise ValueError(f"FString char count too large: {char_count}")
             data = self.read_bytes(char_count * 2)
             try:
                 return data.rstrip(b'\x00\x00').decode('utf-16-le')

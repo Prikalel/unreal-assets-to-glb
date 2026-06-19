@@ -1,0 +1,3 @@
+save your work/investingation results to mcp memory before completing the task
+
+load from there info to ensure not to do things twice before starting new task

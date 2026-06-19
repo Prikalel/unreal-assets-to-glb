@@ -603,11 +603,11 @@ def parse_level(filepath: str, parent_transform: Optional[np.ndarray] = None,
 
         sub_abs = os.path.normpath(os.path.abspath(sub_umap_path))
         if not os.path.isfile(sub_abs):
-            print(f"[umap] LevelInstance WorldAsset not found: {sub_umap_path}")
+            #print(f"[umap] LevelInstance WorldAsset not found: {sub_umap_path}")
             continue
 
         if sub_abs in _visited:
-            print(f"[umap] LevelInstance circular reference skipped: {sub_umap_path}")
+            #print(f"[umap] LevelInstance circular reference skipped: {sub_umap_path}")
             continue
 
         # Get LevelInstance world transform from its RootComponent
@@ -626,7 +626,7 @@ def parse_level(filepath: str, parent_transform: Optional[np.ndarray] = None,
             sub_level = parse_level(sub_umap_path, child_parent_transform,
                                     _visited, _depth + 1)
         except Exception as exc:
-            print(f"[umap] Failed to parse sub-level {sub_umap_path}: {exc}")
+            #print(f"[umap] Failed to parse sub-level {sub_umap_path}: {exc}")
             continue
 
         # Get LevelInstance actor name for parent reference
