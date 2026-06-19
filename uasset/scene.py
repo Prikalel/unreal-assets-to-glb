@@ -436,6 +436,98 @@ def _get_base_color_texture_from_material(material_name: str,
     return None
 
 
+def _get_base_color_factor_from_material(material_name: str,
+                                         uasset_index: Dict[str, str],
+                                         _depth: int = 0) -> Optional[List[float]]:
+    """Return an RGBA base-colour tint (list of 4 floats, 0..1, *linear*) taken
+    from the material's ``VectorParameterValues``.
+
+    Final layer of the binding strategy.  Procedural metals / plastics whose
+    colour is a shader constant (a VectorParameter) have *no* albedo texture,
+    so without this they export as plain white.  UE stores the authored colour
+    as an ``FLinearColor`` in linear space, which is exactly what glTF's
+    ``baseColorFactor`` expects, so no gamma conversion is applied.
+
+    Selection: only non-white, non-black colour params are candidates; a name
+    containing BaseColor/Colour/Color/Albedo/Diffuse/Tint is preferred, and a
+    more saturated colour wins ties.  The parent chain is walked when the
+    current material yields nothing.  Returns ``None`` (=> stay white) for
+    brushed metals whose only colour params are white masks.
+
+    The alpha channel is forced to 1.0 (opaque) — tint-only materials are
+    opaque; transparency always comes through a texture / alpha-mask.
+    """
+    import math
+    if _depth > 8:
+        return None
+    filepath = uasset_index.get(material_name)
+    if filepath is None:
+        return None
+    try:
+        pkg = Package(filepath)
+    except Exception:
+        return None
+
+    mi_idx = None
+    for i in range(pkg.export_count):
+        try:
+            if pkg.get_export_class_name(i) in (
+                    'MaterialInstanceConstant', 'MaterialInstance'):
+                mi_idx = i
+                break
+        except Exception:
+            continue
+    if mi_idx is None:
+        return None
+
+    try:
+        r = pkg.get_export_data(mi_idx)
+        props = read_properties(r, pkg.name_map, pkg.file_version_ue5) or {}
+        elems = _parse_struct_array(pkg, props, 'VectorParameterValues')
+    except Exception:
+        elems = []
+
+    best = None  # (score, name, (r,g,b,a))
+    for e in elems:
+        try:
+            pname = (_extract_parameter_name(e, pkg) or '').lower()
+            val = e.get('ParameterValue')
+            if not isinstance(val, (bytes, bytearray)) or len(val) < 16:
+                continue
+            cr, cg, cb, _ca = struct.unpack_from('<4f', val, 0)
+        except Exception:
+            continue
+        if not all(math.isfinite(c) for c in (cr, cg, cb)):
+            continue
+        mx, mn = max(cr, cg, cb), min(cr, cg, cb)
+        if mx < 1e-3:                                   # pure black = unused
+            continue
+        is_white = (abs(cr - 1.0) < 0.02 and abs(cg - 1.0) < 0.02
+                    and abs(cb - 1.0) < 0.02)
+        if is_white:                                    # white mask, skip
+            continue
+        score = 0.0
+        for key in ('basecolor', 'albedo', 'diffuse', 'colour', 'color',
+                    'tint', 'base'):
+            if key in pname:
+                score += 10.0
+                break
+        score += (mx - mn) * 2.0                        # prefer saturated
+        if best is None or score > best[0]:
+            best = (score, pname, (cr, cg, cb))
+
+    if best is not None:
+        cr, cg, cb = best[2]
+        clamp = lambda v: max(0.0, min(1.0, v))
+        return [clamp(cr), clamp(cg), clamp(cb), 1.0]
+
+    parent = _find_parent_material_name(pkg, material_name)
+    if parent is not None:
+        return _get_base_color_factor_from_material(
+            parent, uasset_index, _depth + 1)
+    return None
+
+
 def _get_base_color_from_master_material(pkg: Package) -> Optional[str]:
     """Parse MaterialEditorOnlyData to find the BaseColor texture.
 

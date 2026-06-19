@@ -1137,7 +1137,8 @@ def _apply_material_mapping(mesh: 'StaticMesh', pkg: Package) -> None:
 # ---------------------------------------------------------------------------
 
 def export_glb(mesh: StaticMesh, filepath: str,
-               textures: Optional[List[Tuple[int, object]]] = None):
+               textures: Optional[List[Tuple[int, object]]] = None,
+               material_colors: Optional[dict] = None):
     """Export a StaticMesh as GLB (binary glTF 2.0) with embedded textures.
 
     Args:
@@ -1290,6 +1291,11 @@ def export_glb(mesh: StaticMesh, filepath: str,
             tex_info.index = len(gltf_textures) - 1
             tex_info.texCoord = 0
             mat.pbrMetallicRoughness.baseColorTexture = tex_info
+        elif (material_colors is not None and mat_idx in material_colors):
+            # Fix C final layer: procedural material with no albedo texture —
+            # use the VectorParameter colour tint as a constant base colour.
+            mat.pbrMetallicRoughness.baseColorFactor = \
+                list(material_colors[mat_idx])
 
         gltf_materials.append(mat)
         mat_idx_to_gltf_mat[mat_idx] = gltf_mat_idx

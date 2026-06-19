@@ -35,6 +35,7 @@ from uasset.scene import (
     _build_uasset_index,
     _get_material_names_from_mesh,
     _get_base_color_texture_from_material,
+    _get_base_color_factor_from_material,
 )
 
 
@@ -213,6 +214,7 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None)
 
     mesh_success = 0
     tex_bound_meshes = 0  # meshes that got at least one embedded texture
+    tint_bound_meshes = 0  # meshes coloured by a VectorParameter tint (no tex)
     for filepath, name in tqdm(sorted(meshes_to_export), desc="Exporting meshes", unit="mesh"):
         try:
             pkg = Package(filepath)
@@ -224,6 +226,7 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None)
                 # ImportedMaterialSlotName which maps to a concrete material
                 # import name through the StaticMaterials array.
                 mesh_textures = []
+                mesh_colors = {}   # mat/pg index -> [r,g,b,a] baseColorFactor
 
                 if mesh.material_slots and mesh.material_slot_names:
                     # Real data path: material_slots is an ordered list of
@@ -248,6 +251,17 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None)
                         if tex_name and tex_name in texture_cache:
                             mesh_textures.append(
                                 (pg_idx, texture_cache[tex_name]))
+                        else:
+                            # Fix C final layer: procedural materials that have
+                            # no albedo texture use a VectorParameter colour
+                            # tint as the glTF baseColorFactor instead of white.
+                            try:
+                                factor = _get_base_color_factor_from_material(
+                                    mat_name, uasset_index)
+                            except Exception:
+                                factor = None
+                            if factor is not None:
+                                mesh_colors[pg_idx] = factor
                 else:
                     # Fallback: no StaticMaterials data — assume polygon
                     # group index == material import index.
@@ -258,20 +272,36 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None)
                         if tex_name and tex_name in texture_cache:
                             mesh_textures.append(
                                 (mat_idx, texture_cache[tex_name]))
+                        else:
+                            try:
+                                factor = _get_base_color_factor_from_material(
+                                    mat_name, uasset_index)
+                            except Exception:
+                                factor = None
+                            if factor is not None:
+                                mesh_colors[mat_idx] = factor
 
                 glb_path = os.path.join(export_dir, "Meshes", f"{name}.glb")
                 export_glb(mesh, glb_path,
-                           textures=mesh_textures if mesh_textures else None)
+                           textures=mesh_textures if mesh_textures else None,
+                           material_colors=mesh_colors if mesh_colors else None)
                 if mesh_textures:
                     tex_bound_meshes += 1
+                elif mesh_colors:
+                    tint_bound_meshes += 1
                 mesh_success += 1
         except Exception as e:
             tqdm.write(f"  {name}: ERROR {e}")
 
+    colored = tex_bound_meshes + tint_bound_meshes
     bind_rate = (100.0 * tex_bound_meshes / mesh_success) if mesh_success else 0.0
+    color_rate = (100.0 * colored / mesh_success) if mesh_success else 0.0
     print(f"Export complete: {mesh_success} meshes, {tex_success} textures")
     print(f"Texture binding: {tex_bound_meshes}/{mesh_success} meshes "
           f"with embedded texture ({bind_rate:.1f}%)")
+    print(f"Coloured meshes: {colored}/{mesh_success} "
+          f"({tex_bound_meshes} textured + {tint_bound_meshes} colour-tinted, "
+          f"{color_rate:.1f}%)")
     return mesh_success, tex_success
 
 
