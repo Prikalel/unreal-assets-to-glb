@@ -776,30 +776,35 @@ def _parse_static_materials(pkg: Package) -> Optional[List[Tuple[str, str]]]:
         return None
     data = reader.data
 
-    # Find the FName index for "StaticMaterials"
-    sm_name_idx = None
-    for ni, n in enumerate(pkg.name_map):
-        if n == 'StaticMaterials':
-            sm_name_idx = ni
-            break
-    if sm_name_idx is None:
+    # Walk the export's tagged properties (start at offset 0 — uncooked
+    # StaticMesh exports have no leading serialization-control byte before
+    # the property block) and grab the StaticMaterials array as raw bytes.
+    # This replaces a fragile ``data.find`` byte-pattern scan that produced
+    # false positives and failed outright on these assets (material_slots was
+    # None, forcing a wrong positional 1:1 fallback in main.py).
+    try:
+        prop_reader = BinaryReader(data)
+        props = read_properties(prop_reader, pkg.name_map,
+                                pkg.file_version_ue5) or {}
+    except Exception:
+        return None
+    raw = props.get('StaticMaterials')
+    if not isinstance(raw, (bytes, bytearray)) or len(raw) < 4:
         return None
 
-    # Search for the FName (index + number=0) in the binary data
-    target = struct.pack('<ii', sm_name_idx, 0)
-    offset = 0
-    while offset < len(data) - len(target):
-        idx = data.find(target, offset)
-        if idx == -1:
-            return None
-        try:
-            result = _parse_static_materials_at(data, idx, pkg)
-            if result is not None:
-                return result
-        except Exception:
-            pass
-        offset = idx + 1
-    return None
+    # Walk the StaticMaterials array value blob.  The value is
+    # int32 count + a 49-byte inner StructProperty descriptor + count tagged
+    # FStaticMaterial elements (MaterialInterface ObjectProperty at a non-
+    # aligned offset, then MaterialSlotName/ImportedMaterialSlotName NameProps,
+    # then a UVChannelData StructProperty, terminated by 'None').  The generic
+    # read_properties() cannot iterate a struct array's tagged elements, so the
+    # descriptor-aware walker in uasset/_static_materials_layout.py — derived
+    # from the UE4.27 source (PropertyArray.cpp:180-326, PropertyTag.cpp:81,
+    # Class.cpp:2718, StaticMesh.cpp:2723) — does it.  This resolves each slot
+    # to its material BY ImportedMaterialSlotName, replacing the wrong
+    # positional 1:1 fallback in main.py.
+    from ._static_materials_layout import parse_static_materials_array
+    return parse_static_materials_array(bytes(raw), pkg.name_map, pkg.imports)
 
 
 def _parse_static_materials_at(data: bytes, offset: int,

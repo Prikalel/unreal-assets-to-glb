@@ -263,23 +263,33 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None)
                             if factor is not None:
                                 mesh_colors[pg_idx] = factor
                 else:
-                    # Fallback: no StaticMaterials data — assume polygon
-                    # group index == material import index.
+                    # Fallback: no StaticMaterials data.  The number of polygon
+                    # groups (material slots) can exceed the number of resolved
+                    # material imports — e.g. a mesh whose slots all reference
+                    # the same imported material (SM_Bucket: Handle+Bucket →
+                    # Mi_Plastic_Bucket).  Iterate over polygon-group indices
+                    # and clamp the material lookup so every group is coloured.
                     material_names = _get_material_names_from_mesh(
                         name, uasset_index)
-                    for mat_idx, mat_name in enumerate(material_names):
-                        tex_name = _resolve_tex(mat_name, name)
-                        if tex_name and tex_name in texture_cache:
-                            mesh_textures.append(
-                                (mat_idx, texture_cache[tex_name]))
-                        else:
-                            try:
-                                factor = _get_base_color_factor_from_material(
-                                    mat_name, uasset_index)
-                            except Exception:
-                                factor = None
-                            if factor is not None:
-                                mesh_colors[mat_idx] = factor
+                    if material_names:
+                        num_pg = (len(mesh.material_slot_names)
+                                  if mesh.material_slot_names
+                                  else len(material_names))
+                        for pg_idx in range(max(num_pg, len(material_names))):
+                            mat_name = material_names[
+                                min(pg_idx, len(material_names) - 1)]
+                            tex_name = _resolve_tex(mat_name, name)
+                            if tex_name and tex_name in texture_cache:
+                                mesh_textures.append(
+                                    (pg_idx, texture_cache[tex_name]))
+                            else:
+                                try:
+                                    factor = _get_base_color_factor_from_material(
+                                        mat_name, uasset_index)
+                                except Exception:
+                                    factor = None
+                                if factor is not None:
+                                    mesh_colors[pg_idx] = factor
 
                 glb_path = os.path.join(export_dir, "Meshes", f"{name}.glb")
                 export_glb(mesh, glb_path,
