@@ -2,6 +2,28 @@
 
 Extracts static meshes (glb) and base color textures (PNG) from Unreal Engine 5.5 `.uasset` files. Supports browser-based level preview with `--preview`.
 
+installation:
+
+```
+pip install unreal-assets-to-glb        # gets the latest = for UE 5.5 assets (pip package version 5.5.0)
+pip install unreal-assets-to-glb==4.27.2.0   # if you want to parse UE 4.27 assets
+```
+
+## Example
+
+### Here is how the asset looks in unreal:
+
+<img width="894" height="488" alt="пример" src="https://github.com/user-attachments/assets/14148b30-db4b-4921-8f14-431a75b60231" />
+
+### Here is how it looks in preview:
+
+https://github.com/user-attachments/assets/b8468b8b-f110-46e9-b798-d624e33d885f
+
+You probably may notice some textures applied wrong thats because there was a little bug that already fixed, the video is made for olden version plus you can find the limitations at the end of that page but I will list some already now:
+
+- complex materials with graph-based shaders not supported
+- Only for Unreal 5.5 / 4.27.2, usage arguents shown below
+
 ## Requirements
 
 - Python 3.10+
