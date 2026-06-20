@@ -4,3 +4,4 @@ Export/
 *.pyc
 debug_*.py
 debug_*.png
+.pypirc
