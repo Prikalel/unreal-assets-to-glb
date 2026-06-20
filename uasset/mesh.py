@@ -23,7 +23,6 @@ import ooz
 
 from .reader import BinaryReader
 from .package import Package
-from .bulk_data import find_mesh_description_bulk_data, BULKDATA_SerializeCompressedZLIB, BulkDataEntry, extract_bulk_data, find_bulk_data_in_export
 from .uncooked_mesh import parse_uncooked_static_mesh
 
 try:
@@ -1031,19 +1030,6 @@ class StaticMesh:
             import traceback
             traceback.print_exc()
 
-        # FALLBACK 1: cooked FStaticMeshRenderData format
-        print("[DEBUG] Trying cooked FStaticMeshRenderData format...")
-        sys.stdout.flush()
-        try:
-            mesh = parse_cooked_static_mesh(pkg)
-            if mesh is not None:
-                print("[DEBUG] Successfully parsed cooked mesh")
-                return mesh
-        except Exception as e:
-            print(f"[DEBUG] Cooked mesh parsing failed: {e}")
-            import traceback
-            traceback.print_exc()
-
         # Fall back to uncooked FMeshDescription format
         print("[DEBUG] Falling back to FMeshDescription format...")
         sys.stdout.flush()
@@ -1426,142 +1412,3 @@ def export_glb(mesh: StaticMesh, filepath: str,
     gltf.set_binary_blob(bytes(binary))
     gltf.save(filepath)
     return filepath
-
-
-# ---------------------------------------------------------------------------
-# FStaticMeshRenderData parsing (Cooked UE4.27)
-# ---------------------------------------------------------------------------
-
-def parse_cooked_static_mesh(pkg: Package) -> Optional[StaticMesh]:
-    """Parse a cooked StaticMesh using FStaticMeshRenderData format.
-    
-    Args:
-        pkg: Package object containing the StaticMesh
-        
-    Returns:
-        StaticMesh object or None if parsing fails
-    """
-    from .mesh_render_data import (
-        find_render_data_bulk_data,
-        decompress_bulk_data,
-        parse_position_vertex_buffer,
-        parse_static_mesh_vertex_buffer,
-        parse_index_buffer,
-        parse_static_mesh_sections
-    )
-    
-    # Find StaticMesh export
-    sm_export_idx = None
-    for i in range(pkg.export_count):
-        if pkg.get_export_class_name(i) == 'StaticMesh':
-            sm_export_idx = i
-            break
-    
-    if sm_export_idx is None:
-        return None
-    
-    # Find bulk data entries
-    bulk_data_list = find_render_data_bulk_data(pkg, sm_export_idx)
-    if bulk_data_list is None:
-        return None
-    
-    mesh = StaticMesh()
-    
-    # Try to identify and parse each bulk data entry
-    for entry, raw_data in bulk_data_list:
-        # Decompress if needed
-        decompressed = decompress_bulk_data(raw_data, entry.flags)
-        if decompressed is None:
-            continue
-        
-        data_len = len(decompressed)
-        
-        # Try to parse as different buffer types based on size and structure
-        
-        # PositionVertexBuffer: starts with num_vertices (uint32), ~12 bytes per vertex
-        if data_len >= 4 and data_len <= 100000000 and not mesh.vertices:
-            try:
-                num_vertices = struct.unpack_from('<I', decompressed, 0)[0]
-                if 0 < num_vertices <= 10000000 and data_len == 4 + num_vertices * 12:
-                    positions = parse_position_vertex_buffer(decompressed)
-                    if positions and len(positions) == num_vertices:
-                        mesh.vertices = positions
-                        continue
-            except:
-                pass
-        
-        # IndexBuffer: starts with stride (uint32) + num_indices (uint32)
-        if data_len >= 8 and not mesh.indices:
-            try:
-                stride = struct.unpack_from('<I', decompressed, 0)[0]
-                if stride in (2, 4):
-                    indices = parse_index_buffer(decompressed)
-                    if indices and len(indices) > 0:
-                        mesh.indices = indices
-                        continue
-            except:
-                pass
-        
-        # StaticMeshVertexBuffer: has stride, num_tex_coords, num_vertices
-        if data_len >= 12 and mesh.vertices and not mesh.uvs:
-            try:
-                stride = struct.unpack_from('<I', decompressed, 0)[0]
-                num_vertices = len(mesh.vertices)
-                if stride >= 32 and stride <= 64:
-                    uv_data = parse_static_mesh_vertex_buffer(decompressed, num_vertices)
-                    if uv_data:
-                        mesh.uvs = uv_data['uvs']
-                        continue
-            except:
-                pass
-        
-        # Sections array
-        if data_len >= 8 and not hasattr(mesh, 'sections'):
-            sections = parse_static_mesh_sections(decompressed)
-            if sections:
-                mesh.sections = sections
-                continue
-    
-    # Validate we have essential data
-    if not mesh.vertices or not mesh.indices:
-        return None
-    
-    # Build triangles from indices
-    if len(mesh.indices) % 3 != 0:
-        return None
-    
-    mesh.triangles = []
-    num_tris = len(mesh.indices) // 3
-    
-    for i in range(num_tris):
-        i0 = mesh.indices[i * 3 + 0]
-        i1 = mesh.indices[i * 3 + 1]
-        i2 = mesh.indices[i * 3 + 2]
-        
-        # Determine material index from sections
-        mat_idx = 0
-        if hasattr(mesh, 'sections') and mesh.sections:
-            for section in mesh.sections:
-                first_tri = section['first_index'] // 3
-                tri_count = section['num_triangles']
-                if first_tri <= i < first_tri + tri_count:
-                    mat_idx = section['material_index']
-                    break
-        
-        mesh.triangles.append((i0, i1, i2, mat_idx))
-    
-    # Parse material slots from export
-    mesh.material_slots = _parse_static_materials(pkg)
-    
-    # Build material slot names
-    if mesh.material_slots:
-        mesh.material_slot_names = [slot[0] if slot else f"Material_{i}"
-                                    for i, slot in enumerate(mesh.material_slots)]
-    else:
-        mesh.material_slot_names = ["Material_0"]
-    
-    # Build vi_to_vertex (identity mapping for cooked meshes)
-    mesh.vi_to_vertex = list(range(len(mesh.vertices)))
-    
-    return mesh
-    gltf.save(filepath)
