@@ -7,9 +7,9 @@ Extracts static meshes (glb) and base color textures (PNG) from Unreal Engine 4.
 - Python 3.10+
 - numpy
 - Pillow
-- ooz-python
+- pyooz (provides the `ooz` Oodle-decompression module)
+- pygltflib
 - tqdm
-- TODO : add other requirements
 
 ## Usage
 

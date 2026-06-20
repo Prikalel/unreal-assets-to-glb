@@ -5,3 +5,12 @@ Export/
 *.pyc
 debug_*.py
 debug_*.png
+
+# Packaging / build artifacts (generated, not source)
+.pypirc
+build/
+dist/
+*.egg-info/
+.eggs/
+_testvenv/
+__pycache__/

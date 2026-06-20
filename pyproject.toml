@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=77.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unreal-assets-to-glb"
+# Version mirrors the targeted Unreal Engine version (UE 4.27.2 -> "4.27.2.0",
+# UE 5.5 -> "5.5.0"). It is read dynamically from uasset.__version__ so the same
+# pyproject.toml can be reused on every feature branch.
+dynamic = ["version"]
+description = "Extract static meshes (.glb) and base-color textures (.png) from uncooked Unreal Engine .uasset files, with an optional browser level preview."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE.md"]
+authors = [{ name = "Velikiy Prikalel" }]
+keywords = [
+    "unreal-engine",
+    "uasset",
+    "umap",
+    "glb",
+    "gltf",
+    "ue4",
+    "ue5",
+    "static-mesh",
+    "exporter",
+    "game-assets",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+    "Topic :: Multimedia :: Graphics :: Graphics Conversion",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "numpy>=1.24.0",
+    "tqdm>=4.60.0",
+    "pyooz>=0.0.8",        # provides the `ooz` module (Oodle decompression)
+    "pygltflib>=1.16.0",
+    "Pillow>=9.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/Prikalel/unreal-assets-to-glb"
+Repository = "https://github.com/Prikalel/unreal-assets-to-glb"
+Issues = "https://github.com/Prikalel/unreal-assets-to-glb/issues"
+Changelog = "https://github.com/Prikalel/unreal-assets-to-glb/releases"
+
+[project.scripts]
+unreal-assets-to-glb = "uasset.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "uasset.__version__" }
+
+[tool.setuptools.packages.find]
+include = ["uasset*"]
+
+[tool.setuptools.package-data]
+uasset = ["preview.html"]
