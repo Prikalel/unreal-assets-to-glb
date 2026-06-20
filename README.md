@@ -1,6 +1,6 @@
 # UE 5.5 UAsset Parser & Exporter
 
-Extracts static meshes (glb) and base color textures (PNG) from Unreal Engine 5.5 `.uasset` files. Supports browser-based level preview with `--preview`.
+Extracts static meshes (glb) and base color textures (PNG) from Unreal Engine 5.5 `.uasset` files. Supports browser-based level preview with `--preview`. Not requires Unreal engine installation!
 
 installation:
 
