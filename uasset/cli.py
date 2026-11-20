@@ -20,13 +20,13 @@ import argparse
 import os
 import sys
 import json
+import shutil
+import tempfile
 import traceback
 from tqdm import tqdm
 
 from uasset.package import Package
 from uasset.mesh import StaticMesh, export_glb
-import pickle
-import hashlib
 from uasset.texture import Texture2D, export_png
 from uasset.properties import read_properties
 from uasset.scene import (
@@ -90,12 +90,24 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None)
     """Find and export all meshes as GLB and base color textures as PNG.
 
     Args:
+        skip_textures: If set, the PNGs (which the GLBs embed from) go to a
+            temporary folder that is removed afterwards, not Export/Textures.
         mesh_filter: If set, only export meshes whose name contains this
-            substring (case-insensitive).  Textures are still fully cached.
+            substring (case-insensitive).  Textures are still all exported.
     """
     os.makedirs(os.path.join(export_dir, "Meshes"), exist_ok=True)
-    os.makedirs(os.path.join(export_dir, "Textures"), exist_ok=True)
+    if not skip_textures:
+        tex_dir = os.path.join(export_dir, "Textures")
+        os.makedirs(tex_dir, exist_ok=True)
+        return _export_assets(input_dir, export_dir, tex_dir, mesh_filter)
+    tex_dir = tempfile.mkdtemp(prefix="uasset-textures-")
+    try:
+        return _export_assets(input_dir, export_dir, tex_dir, mesh_filter)
+    finally:
+        shutil.rmtree(tex_dir, ignore_errors=True)
 
+
+def _export_assets(input_dir, export_dir, tex_dir, mesh_filter):
     uassets, umaps = find_uasset_files(input_dir)
     print(f"Found {len(uassets)} .uasset files, {len(umaps)} .umap files")
 
@@ -120,64 +132,77 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None)
     # ------------------------------------------------------------------
     # Export base color textures as PNG  (also cache pixel data for GLB)
     # ------------------------------------------------------------------
-    # Use pickle cache to avoid re-parsing textures when Input/ is unchanged
-    cache_path = os.path.join(export_dir, "texture_cache.pkl")
+    # Textures go straight to PNG on disk and are reloaded on demand when a
+    # mesh embeds them; holding every decoded texture in memory (and in a
+    # pickle cache) needs ~64 MB per 4K texture and runs a big pack out of
+    # RAM.  A PNG that already exists and verifies is not decoded again, so
+    # an interrupted run resumes where it stopped.
+    from collections import OrderedDict
+    from PIL import Image
+    import numpy as np
 
-    # Compute a quick fingerprint of the Input/ texture files
-    def _input_fingerprint():
-        h = hashlib.md5()
-        for fp, n in sorted(textures):
-            h.update(n.encode())
-            h.update(str(os.path.getmtime(fp)).encode())
-            h.update(str(os.path.getsize(fp)).encode())
-        return h.hexdigest()
+    class _PngTextures:
+        """name -> RGBA pixels, loaded from tex_dir; keeps the last few."""
+
+        def __init__(self, names, keep=4):
+            self.names = set(names)
+            self.keep = keep
+            self.loaded = OrderedDict()
+
+        def __contains__(self, name):
+            return name in self.names
+
+        def __iter__(self):
+            return iter(self.names)
+
+        def __len__(self):
+            return len(self.names)
+
+        def __getitem__(self, name):
+            if name not in self.names:
+                raise KeyError(name)
+            if name in self.loaded:
+                self.loaded.move_to_end(name)
+                return self.loaded[name]
+            with Image.open(os.path.join(tex_dir, f"{name}.png")) as im:
+                pixels = np.array(im.convert('RGBA'))
+            self.loaded[name] = pixels
+            while len(self.loaded) > self.keep:
+                self.loaded.popitem(last=False)
+            return pixels
+
+    def _png_ok(path):
+        try:
+            with Image.open(path) as im:
+                im.verify()
+            return True
+        except Exception:
+            return False
 
     tex_success = 0
-    texture_cache = {}  # texture_name -> numpy RGBA pixels
-    tex_name_map = {}
+    done_names = []
 
     base_color_textures = [(fp, n) for fp, n in textures]  # export ALL textures
     print(f"Textures to export: {len(base_color_textures)}")
 
-    # Try loading from pickle cache
-    fp_hash = _input_fingerprint()
-    cache_loaded = False
-    if os.path.exists(cache_path):
+    for filepath, name in tqdm(sorted(base_color_textures), desc="Exporting textures", unit="tex"):
+        png_path = os.path.join(tex_dir, f"{name}.png")
+        if os.path.exists(png_path) and _png_ok(png_path):
+            done_names.append(name)
+            tex_success += 1
+            continue
         try:
-            with open(cache_path, "rb") as f:
-                cached = pickle.load(f)
-            if isinstance(cached, dict) and cached.get("fingerprint") == fp_hash:
-                texture_cache = cached["textures"]
-                tex_success = len(texture_cache)
-                cache_loaded = True
-                print(f"  Loaded {tex_success} textures from pickle cache")
-        except Exception:
-            pass  # Corrupt cache — rebuild
-
-    if not cache_loaded:
-        for filepath, name in tqdm(sorted(base_color_textures), desc="Exporting textures", unit="tex"):
-            try:
-                pkg = Package(filepath)
-                texture = Texture2D.from_package(pkg)
-                if texture and texture.pixels is not None:
-                    if not skip_textures:
-                        png_path = os.path.join(export_dir, "Textures", f"{name}.png")
-                        export_png(texture, png_path)
-                    texture_cache[name] = texture.pixels
-                    tex_success += 1
-            except Exception as e:
-                tqdm.write(f"  {name}: ERROR {e}")
-
-        # Save pickle cache
-        try:
-            with open(cache_path, "wb") as f:
-                pickle.dump({"fingerprint": fp_hash, "textures": texture_cache}, f)
-            print(f"  Saved texture cache ({tex_success} textures) to {cache_path}")
+            pkg = Package(filepath)
+            texture = Texture2D.from_package(pkg)
+            if texture and texture.pixels is not None:
+                export_png(texture, png_path)
+                done_names.append(name)
+                tex_success += 1
+            del texture
         except Exception as e:
-            print(f"  Warning: could not save texture cache: {e}")
+            tqdm.write(f"  {name}: ERROR {e}")
 
-    if skip_textures:
-        print(f"  (PNG file export skipped --skip-textures, {tex_success} textures cached for GLB)")
+    texture_cache = _PngTextures(done_names)
 
     # Identity map so _get_base_color_texture_from_material returns the texture name
     tex_name_map = {name: name for name in texture_cache}

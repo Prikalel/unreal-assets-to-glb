@@ -12,4 +12,4 @@ dist/
 *.egg-info/
 .eggs/
 _testvenv/
-__pycache__/
+__pycache__/.venv/
