@@ -20,13 +20,13 @@ import argparse
 import os
 import sys
 import json
+import shutil
+import tempfile
 import traceback
 from tqdm import tqdm
 
 from uasset.package import Package
 from uasset.mesh import StaticMesh, export_glb
-import pickle
-import hashlib
 from uasset.texture import Texture2D, export_png
 from uasset.properties import read_properties
 from uasset.scene import (
@@ -90,12 +90,24 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None)
     """Find and export all meshes as GLB and base color textures as PNG.
 
     Args:
+        skip_textures: If set, the PNGs (which the GLBs embed from) go to a
+            temporary folder that is removed afterwards, not Export/Textures.
         mesh_filter: If set, only export meshes whose name contains this
-            substring (case-insensitive).  Textures are still fully cached.
+            substring (case-insensitive).  Textures are still all exported.
     """
     os.makedirs(os.path.join(export_dir, "Meshes"), exist_ok=True)
-    os.makedirs(os.path.join(export_dir, "Textures"), exist_ok=True)
+    if not skip_textures:
+        tex_dir = os.path.join(export_dir, "Textures")
+        os.makedirs(tex_dir, exist_ok=True)
+        return _export_assets(input_dir, export_dir, tex_dir, mesh_filter)
+    tex_dir = tempfile.mkdtemp(prefix="uasset-textures-")
+    try:
+        return _export_assets(input_dir, export_dir, tex_dir, mesh_filter)
+    finally:
+        shutil.rmtree(tex_dir, ignore_errors=True)
 
+
+def _export_assets(input_dir, export_dir, tex_dir, mesh_filter):
     uassets, umaps = find_uasset_files(input_dir)
     print(f"Found {len(uassets)} .uasset files, {len(umaps)} .umap files")
 
@@ -128,8 +140,6 @@ def process_assets(input_dir, export_dir, skip_textures=False, mesh_filter=None)
     from collections import OrderedDict
     from PIL import Image
     import numpy as np
-
-    tex_dir = os.path.join(export_dir, "Textures")
 
     class _PngTextures:
         """name -> RGBA pixels, loaded from tex_dir; keeps the last few."""
