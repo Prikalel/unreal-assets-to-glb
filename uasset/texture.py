@@ -22,7 +22,7 @@ from .properties import (
     UE5_PROPERTY_TAG_EXTENSION,
     TAG_HasArrayIndex, TAG_HasPropertyGuid, TAG_HasPropertyExtensions,
 )
-from .mesh import extract_trailer_payload, decompress_compressed_buffer
+from .mesh import extract_payload, decompress_compressed_buffer
 
 # ---------------------------------------------------------------------------
 # ETextureSourceFormat enum
@@ -183,26 +183,80 @@ def _parse_fname(r: BinaryReader, name_map: List[str]) -> str:
     return name_map[idx] if 0 <= idx < len(name_map) else f"#{idx}"
 
 
+def _read_tag_header(r: BinaryReader, name_map: List[str],
+                     file_version_ue5: int):
+    """Read one property tag up to its value, in either tag layout.
+
+    Returns None at the "None" terminator, else (name, type_name, size,
+    bool_value, post) where post is a callable that consumes whatever the
+    tag stores after its value (new layout only).
+
+    UE >= 5.4 (PROPERTY_TAG_COMPLETE_TYPE_NAME) writes FPropertyTypeName +
+    Size + Flags.  Older UE5 (e.g. 5.2) writes the UE4 layout: Type FName +
+    Size + ArrayIndex + type-specific header + HasPropertyGuid, all before
+    the value.
+    """
+    name_idx = r.read_int32()
+    _name_num = r.read_int32()
+    name = name_map[name_idx] if 0 <= name_idx < len(name_map) else f"#{name_idx}"
+    if name == "None":
+        return None
+
+    if file_version_ue5 >= UE5_PROPERTY_TAG_COMPLETE_TYPE_NAME:
+        use_ext = file_version_ue5 >= UE5_PROPERTY_TAG_EXTENSION
+        type_name = _read_property_type_name(r, name_map)
+        size = r.read_int32()
+        flags = r.read_uint8()
+        if flags & TAG_HasArrayIndex:
+            r.skip(4)
+
+        def post():
+            if flags & TAG_HasPropertyGuid:
+                r.skip(16)
+            if use_ext and (flags & TAG_HasPropertyExtensions):
+                ext = r.read_uint8()
+                if ext & 0x01:
+                    r.skip(1 + 4)
+
+        return name, type_name, size, bool(flags & 0x10), post
+
+    type_idx = r.read_int32()
+    _type_num = r.read_int32()
+    type_name = name_map[type_idx] if 0 <= type_idx < len(name_map) else f"#{type_idx}"
+    size = r.read_int32()
+    _array_index = r.read_int32()
+    bool_value = False
+    if type_name == "StructProperty":
+        r.skip(8 + 16)               # StructName FName + StructGuid
+    elif type_name == "BoolProperty":
+        bool_value = r.read_uint8() != 0
+    elif type_name in ("ByteProperty", "EnumProperty", "ArrayProperty",
+                       "SetProperty"):
+        r.skip(8)                    # EnumName / InnerType FName
+    elif type_name == "MapProperty":
+        r.skip(16)                   # InnerType + ValueType FNames
+    if r.read_uint8():               # HasPropertyGuid
+        r.skip(16)
+    return name, type_name, size, bool_value, (lambda: None)
+
+
+def _has_serialization_control(file_version_ue5: int) -> bool:
+    """UE >= PROPERTY_TAG_EXTENSION prefixes tagged properties with a
+    1-byte SerializationControl; older UE5 (e.g. 5.2) does not."""
+    return file_version_ue5 >= UE5_PROPERTY_TAG_EXTENSION
+
+
 def _extract_source_struct(r: BinaryReader, name_map: List[str],
                            file_version_ue5: int, struct_size: int) -> dict:
     """Parse FTextureSource struct to extract key fields."""
-    use_ext = file_version_ue5 >= UE5_PROPERTY_TAG_EXTENSION
     end_pos = r.position() + struct_size
     result = {}
 
     while r.position() < end_pos - 8:
-        name_idx = r.read_int32()
-        _name_num = r.read_int32()
-        name = name_map[name_idx] if 0 <= name_idx < len(name_map) else f"#{name_idx}"
-        if name == "None":
+        tag = _read_tag_header(r, name_map, file_version_ue5)
+        if tag is None:
             break
-
-        type_name = _read_property_type_name(r, name_map)
-        size = r.read_int32()
-        flags = r.read_uint8()
-
-        if flags & TAG_HasArrayIndex:
-            r.skip(4)
+        name, type_name, size, bool_value, post = tag
 
         if name in ("SizeX", "SizeY", "NumSlices", "NumMips", "NumLayers") \
                 and type_name == "IntProperty" and size == 4:
@@ -226,16 +280,11 @@ def _extract_source_struct(r: BinaryReader, name_map: List[str],
             else:
                 r.skip(size)
         elif name == "bPNGCompressed" and type_name == "BoolProperty":
-            result['bPNGCompressed'] = bool(flags & 0x10)
-        else:
+            result['bPNGCompressed'] = bool_value
+        elif type_name != "BoolProperty":
             r.skip(size)
 
-        if flags & TAG_HasPropertyGuid:
-            r.skip(16)
-        if use_ext and (flags & TAG_HasPropertyExtensions):
-            ext = r.read_uint8()
-            if ext & 0x01:
-                r.skip(1 + 4)
+        post()
 
     if r.position() < end_pos:
         r.seek(end_pos)
@@ -273,41 +322,29 @@ class Texture2D:
 
         tex = cls()
 
-        # SerializationControl (1 byte)
-        data_reader.read_uint8()
+        # SerializationControl (1 byte, UE >= 5.4 only)
+        if _has_serialization_control(pkg.file_version_ue5):
+            data_reader.read_uint8()
 
         # Parse properties to find Source struct
-        use_ext = pkg.file_version_ue5 >= UE5_PROPERTY_TAG_EXTENSION
         source_data = {}
 
         while True:
             if not data_reader.can_read(8):
                 break
-            name_idx = data_reader.read_int32()
-            _name_num = data_reader.read_int32()
-            name = pkg.name_map[name_idx] if 0 <= name_idx < len(pkg.name_map) else f"#{name_idx}"
-            if name == "None":
+            tag = _read_tag_header(data_reader, pkg.name_map,
+                                   pkg.file_version_ue5)
+            if tag is None:
                 break
-
-            type_name = _read_property_type_name(data_reader, pkg.name_map)
-            size = data_reader.read_int32()
-            flags = data_reader.read_uint8()
-
-            if flags & TAG_HasArrayIndex:
-                data_reader.skip(4)
+            name, type_name, size, _bool_value, post = tag
 
             if name == "Source" and "StructProperty" in type_name:
                 source_data = _extract_source_struct(
                     data_reader, pkg.name_map, pkg.file_version_ue5, size)
-            else:
+            elif type_name != "BoolProperty":
                 data_reader.skip(size)
 
-            if flags & TAG_HasPropertyGuid:
-                data_reader.skip(16)
-            if use_ext and (flags & TAG_HasPropertyExtensions):
-                ext = data_reader.read_uint8()
-                if ext & 0x01:
-                    data_reader.skip(1 + 4)
+            post()
 
         # HasObjectGuid
         has_guid = data_reader.read_int32()
@@ -332,7 +369,7 @@ class Texture2D:
             return None
 
         # Extract and decompress trailer payload
-        compressed_buffer = extract_trailer_payload(pkg.reader.data)
+        compressed_buffer = extract_payload(pkg.reader.data)
         if compressed_buffer is None:
             return None
 
@@ -340,17 +377,21 @@ class Texture2D:
         if raw_data is None:
             return None
 
-        needed = tex.width * tex.height * bpp
-        if len(raw_data) < needed:
-            return None
-
-        # Check for PNG data
-        bpng = source_data.get('bPNGCompressed', False)
-        if bpng and raw_data[:4] == b'\x89PNG':
+        # Check for PNG data.  UE 5.5 flags it with bPNGCompressed; UE 5.2
+        # only sets CompressionFormat = TSCF_PNG, so go by the signature.
+        # A PNG payload is smaller than the raw size, so test it first.
+        if raw_data[:8] == b'\x89PNG\r\n\x1a\n':
             from io import BytesIO
             try:
                 img = Image.open(BytesIO(raw_data))
-                tex.pixels = np.array(img.convert('RGBA'))
+                pixels = np.array(img.convert('RGBA'))
+                # UE writes 8-bit BGRA8 source into the PNG without
+                # reordering, so its "RGB" is really BGR.  16-bit sources
+                # (RGBA16) are true RGBA; grey/palette PNGs have no order.
+                bit_depth, color_type = raw_data[24], raw_data[25]
+                if bit_depth == 8 and color_type in (2, 6):
+                    pixels[:, :, [0, 2]] = pixels[:, :, [2, 0]]
+                tex.pixels = pixels
                 tex.width = img.width
                 tex.height = img.height
                 tex.format = 1  # BGRA8 equivalent
@@ -358,6 +399,10 @@ class Texture2D:
                 return tex
             except Exception:
                 return None
+
+        needed = tex.width * tex.height * bpp
+        if len(raw_data) < needed:
+            return None
 
         # Apply UEDELTA reverse transform if needed
         if tex.compression_format == 4:  # TSCF_UEDELTA

@@ -34,6 +34,16 @@ _BASE_COLOR_PARAM_NAMES = frozenset({
     'Base Color', 'DiffuseTexture',
 })
 
+# Packs spell the parameter many ways ("00_BaseColor", "BaseColour",
+# "Base Color Texture"); compare on letters only, case-folded.
+_BASE_COLOR_KEYS = ('basecolor', 'basecolour', 'basetexture', 'albedo',
+                    'diffuse')
+
+
+def _is_base_color_param(param_name: str) -> bool:
+    key = ''.join(c for c in param_name.lower() if c.isalpha())
+    return any(k in key for k in _BASE_COLOR_KEYS)
+
 # ---------------------------------------------------------------------------
 # Low-level helpers for reading UE property headers from export data
 # ---------------------------------------------------------------------------
@@ -68,17 +78,49 @@ def _skip_property_extensions(r: BinaryReader) -> None:
         r.skip(5)
 
 
+_UE5_PROPERTY_TAG_EXTENSION = 1011
+_UE5_PROPERTY_TAG_COMPLETE_TYPE_NAME = 1012
+
+
 def _read_property_header(r: BinaryReader, name_map: List[str],
-                          use_extensions: bool
+                          file_version_ue5: int
                           ) -> Optional[Tuple[str, List[str], int, int]]:
-    """Read a UE5 property tag header.
+    """Read a UE5 property tag header, in either tag layout.
 
     Returns ``(name, type_names, size, flags)`` or ``None`` when the
     sentinel ``None`` FName is reached (end of property list).
+
+    UE >= 5.4 writes an FPropertyTypeName tree + Size + Flags.  Older UE5
+    (e.g. 5.2) writes the UE4 layout: Type FName + Size + ArrayIndex +
+    type-specific header + HasPropertyGuid.  For the old layout the
+    type-specific FNames become type_names[1:], and a true BoolProperty
+    sets flag 0x10, so callers see the same shape either way.
     """
     name = _read_fname(r, name_map)
     if name == 'None':
         return None
+    if file_version_ue5 < _UE5_PROPERTY_TAG_COMPLETE_TYPE_NAME:
+        type_name = _read_fname(r, name_map)
+        size = r.read_int32()
+        r.skip(4)                                  # ArrayIndex
+        type_names = [type_name]
+        flags = 0
+        if type_name == 'StructProperty':
+            type_names.append(_read_fname(r, name_map))
+            r.skip(16)                             # StructGuid
+        elif type_name == 'BoolProperty':
+            if r.read_uint8():
+                flags |= 0x10
+        elif type_name in ('ByteProperty', 'EnumProperty', 'ArrayProperty',
+                           'SetProperty'):
+            type_names.append(_read_fname(r, name_map))
+        elif type_name == 'MapProperty':
+            type_names.append(_read_fname(r, name_map))
+            type_names.append(_read_fname(r, name_map))
+        if r.read_uint8():                         # HasPropertyGuid
+            r.skip(16)
+        return name, type_names, size, flags
+    use_extensions = file_version_ue5 >= _UE5_PROPERTY_TAG_EXTENSION
     type_names = _read_type_tree(r, name_map)
     size = r.read_int32()
     flags = r.read_uint8()
@@ -126,10 +168,10 @@ def _parse_texture_parameter_values(pkg: Package) -> Dict[str, str]:
     if offset < 0:
         return {}
 
-    use_ext = pkg.file_version_ue5 >= 1011  # UE5_PROPERTY_TAG_EXTENSION
+    ver = pkg.file_version_ue5
     reader.seek(offset)
 
-    hdr = _read_property_header(reader, pkg.name_map, use_ext)
+    hdr = _read_property_header(reader, pkg.name_map, ver)
     if hdr is None:
         return {}
 
@@ -138,6 +180,9 @@ def _parse_texture_parameter_values(pkg: Package) -> Dict[str, str]:
         return {}
 
     arr_count = reader.read_int32()
+    if ver < _UE5_PROPERTY_TAG_COMPLETE_TYPE_NAME:
+        # Old layout: an array of structs repeats one inner tag first
+        _read_property_header(reader, pkg.name_map, ver)
     result: Dict[str, str] = {}
 
     for _ in range(arr_count):
@@ -146,7 +191,7 @@ def _parse_texture_parameter_values(pkg: Package) -> Dict[str, str]:
 
         # Read inner properties until 'None' sentinel
         while True:
-            prop_hdr = _read_property_header(reader, pkg.name_map, use_ext)
+            prop_hdr = _read_property_header(reader, pkg.name_map, ver)
             if prop_hdr is None:
                 break
 
@@ -157,7 +202,7 @@ def _parse_texture_parameter_values(pkg: Package) -> Dict[str, str]:
                 # FMaterialParameterInfo — read inner props
                 while True:
                     inner_hdr = _read_property_header(reader, pkg.name_map,
-                                                      use_ext)
+                                                      ver)
                     if inner_hdr is None:
                         break
                     i_name, i_types, i_size, _i_flags = inner_hdr
@@ -212,10 +257,10 @@ def _parse_scalar_parameter_values(pkg: Package) -> Dict[str, float]:
     if offset < 0:
         return {}
 
-    use_ext = pkg.file_version_ue5 >= 1011
+    ver = pkg.file_version_ue5
     reader.seek(offset)
 
-    hdr = _read_property_header(reader, pkg.name_map, use_ext)
+    hdr = _read_property_header(reader, pkg.name_map, ver)
     if hdr is None:
         return {}
 
@@ -224,6 +269,9 @@ def _parse_scalar_parameter_values(pkg: Package) -> Dict[str, float]:
         return {}
 
     arr_count = reader.read_int32()
+    if ver < _UE5_PROPERTY_TAG_COMPLETE_TYPE_NAME:
+        # Old layout: an array of structs repeats one inner tag first
+        _read_property_header(reader, pkg.name_map, ver)
     result: Dict[str, float] = {}
 
     for _ in range(arr_count):
@@ -231,7 +279,7 @@ def _parse_scalar_parameter_values(pkg: Package) -> Dict[str, float]:
         param_value: Optional[float] = None
 
         while True:
-            prop_hdr = _read_property_header(reader, pkg.name_map, use_ext)
+            prop_hdr = _read_property_header(reader, pkg.name_map, ver)
             if prop_hdr is None:
                 break
 
@@ -241,7 +289,7 @@ def _parse_scalar_parameter_values(pkg: Package) -> Dict[str, float]:
             if p_name == 'ParameterInfo' and p_types[0] == 'StructProperty':
                 while True:
                     inner_hdr = _read_property_header(reader, pkg.name_map,
-                                                      use_ext)
+                                                      ver)
                     if inner_hdr is None:
                         break
                     i_name, i_types, i_size, _i_flags = inner_hdr
@@ -385,7 +433,7 @@ def _get_base_color_texture_from_material(material_name: str,
 
     # Look for a base-color parameter name
     for param_name, tex_asset_name in tex_params.items():
-        if param_name in _BASE_COLOR_PARAM_NAMES:
+        if _is_base_color_param(param_name):
             # Resolve via tex_map (case-insensitive fallback)
             mapped = tex_map.get(tex_asset_name)
             if mapped is None:
@@ -480,38 +528,17 @@ def _get_base_color_from_master_material(pkg: Package) -> Optional[str]:
     if reader is None:
         return None
 
-    use_ext = pkg.file_version_ue5 >= UE5_PROPERTY_TAG_EXTENSION
+    ver = pkg.file_version_ue5
 
-    # Skip SerializationControl byte
-    reader.seek(1)
+    # SerializationControl byte (UE >= 5.4 only)
+    reader.seek(1 if ver >= _UE5_PROPERTY_TAG_EXTENSION else 0)
 
     # Read tagged properties until we find BaseColor
     while reader.can_read(8):
-        name_idx = reader.read_int32()
-        _name_num = reader.read_int32()
-        name = pkg.name_map[name_idx] if 0 <= name_idx < len(pkg.name_map) else f"#{name_idx}"
-
-        if name == 'None':
+        hdr = _read_property_header(reader, pkg.name_map, ver)
+        if hdr is None:
             break
-
-        # Read type tree
-        total_nodes = 1
-        type_names: List[str] = []
-        i = 0
-        while i < total_nodes:
-            t_idx = reader.read_int32()
-            _t_num = reader.read_int32()
-            inner_count = reader.read_int32()
-            t_name = pkg.name_map[t_idx] if 0 <= t_idx < len(pkg.name_map) else f"#{t_idx}"
-            type_names.append(t_name)
-            total_nodes += inner_count
-            i += 1
-
-        size = reader.read_int32()
-        flags = reader.read_uint8()
-
-        if flags & TAG_HasArrayIndex:
-            reader.skip(4)
+        name, type_names, size, flags = hdr
 
         value_start = reader.position()
 
@@ -545,13 +572,6 @@ def _get_base_color_from_master_material(pkg: Package) -> Optional[str]:
                                 return tex_name
         else:
             reader.skip(size)
-
-        if flags & TAG_HasPropertyGuid:
-            reader.skip(16)
-        if use_ext and (flags & TAG_HasPropertyExtensions):
-            ext = reader.read_uint8()
-            if ext & 0x01:
-                reader.skip(1 + 4)
 
         # Ensure alignment
         remaining = size - (reader.position() - value_start)

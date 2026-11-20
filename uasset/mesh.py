@@ -65,6 +65,12 @@ def decompress_compressed_buffer(data: bytes) -> Optional[bytes]:
     total_raw_size = _be_uint64(data, 16)
     block_size = 1 << block_size_exp if block_size_exp > 0 else 0
 
+    # Method 0 (None): the raw bytes follow the 64-byte header directly,
+    # with no block-size table (seen in UE 5.0 PNG texture sources).
+    if method == 0:
+        raw = data[64:64 + total_raw_size]
+        return bytes(raw) if len(raw) == total_raw_size else None
+
     # Parse block sizes (big-endian uint32 array after 64-byte header)
     block_sizes_offset = 64
     block_sizes = []
@@ -148,6 +154,42 @@ def extract_trailer_payload(file_data: bytes) -> Optional[bytes]:
         return None
 
     return file_data[payload_section_start:payload_section_start + payloads_data_length]
+
+
+def extract_inline_payload(file_data: bytes) -> Optional[bytes]:
+    """Find the first non-empty editor bulk data payload in a package that
+    has no package trailer (UE 5.0).
+
+    UE 5.0 writes each FEditorBulkData header in the export as
+    Flags(u32) + BulkDataId(16) + PayloadContentId(20) + PayloadSize(i64)
+    + OffsetInFile(i64), with OffsetInFile absolute, pointing at an
+    FCompressedBuffer appended after the exports.  A buffer is accepted only
+    when some header's PayloadSize/OffsetInFile pair names it exactly; the
+    one whose header comes first in the file wins (LOD0 / the texture
+    source), matching what the trailer path returns.
+    """
+    magic = struct.pack('>I', 0xB7756362)
+    best = None  # (header_pos, buffer_pos)
+    pos = file_data.find(magic)
+    while pos >= 0:
+        if pos + 32 <= len(file_data):
+            raw_size = _be_uint64(file_data, pos + 16)
+            if raw_size > 0:
+                hdr = file_data.find(struct.pack('<qq', raw_size, pos))
+                if 0 <= hdr < pos and (best is None or hdr < best[0]):
+                    best = (hdr, pos)
+        pos = file_data.find(magic, pos + 1)
+    if best is None:
+        return None
+    return file_data[best[1]:]
+
+
+def extract_payload(file_data: bytes) -> Optional[bytes]:
+    """Payload from the package trailer (UE >= 5.1), else inline (UE 5.0)."""
+    payload = extract_trailer_payload(file_data)
+    if payload is not None and payload[:4] == struct.pack('>I', 0xB7756362):
+        return payload
+    return extract_inline_payload(file_data)
 
 
 # ---------------------------------------------------------------------------
@@ -850,7 +892,7 @@ class StaticMesh:
         file_data = pkg.reader.data
 
         # Extract FCompressedBuffer from package trailer
-        compressed_buffer = extract_trailer_payload(file_data)
+        compressed_buffer = extract_payload(file_data)
         if compressed_buffer is None:
             return None
 
